@@ -25,7 +25,7 @@ from llama_cpp.server.app import create_app
 from llama_cpp.server.settings import Settings
 
 _ROOT = Path(__file__).resolve().parents[2]  # 仓库根
-DEFAULT_MODEL = str(_ROOT / "models" / "Qwen3.5-4B-Q4_K_M.gguf")
+DEFAULT_MODEL = str(_ROOT / "models" / "Qwen3.8-27B-UD-Q4_K_XL.gguf")
 
 # 显存预算(字节)。MIG 2g.35gb ≈ 35GB。权重 ~17GB,fixed 开销(CUDA ctx/激活) ~4GB,
 # 留给 KV cache 的预算 = TOTAL - WEIGHT - FIXED。

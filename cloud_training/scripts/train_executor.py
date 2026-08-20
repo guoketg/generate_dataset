@@ -423,7 +423,8 @@ class TrainExecutor:
                             message="订单号不存在，请核对后重试")
         return envelope(True, data={
             "order_id": order_id, "status": track["status"],
-            "status_cn": track["status_cn"], "trajectory": track["trajectory"],
+            "status_cn": STATUS_CN.get(track["status"], track["status"]),
+            "trajectory": track["trajectory"],
         })
 
     def _tool_query_refund(self, args: dict) -> dict:
