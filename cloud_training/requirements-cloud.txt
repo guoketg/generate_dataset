@@ -1,0 +1,12 @@
+# cloud_training 数据生成依赖
+# 运行时需先启动 llama-server(见 decisions.log),脚本通过 llm_client 走 HTTP 调用。
+# 若直接本地加载模型,则需带 CUDA 构建的 llama-cpp-python(见下方注释)。
+
+requests>=2.31
+httpx>=0.27
+Pillow>=10.0
+qrcode>=7.4
+
+# 本地直连模型时才需要(默认 D1 走 llama-server,可不装):
+# llama-cpp-python>=0.2.90  # 安装需 CUDA 构建:
+#   CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --no-cache-dir --force-reinstall

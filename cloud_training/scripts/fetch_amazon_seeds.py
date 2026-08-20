@@ -84,7 +84,7 @@ def iter_records(cat: str):
 
 
 def sample_category(cat: str, out_dir: Path) -> list[dict]:
-    rng = random.Random(SEED + hash(cat) % 10000)
+    rng = random.Random(SEED + sum(map(ord, cat)) % 10000)
     pool: list[dict] = []          # 水库抽样
     all_prices: list[float] = []   # 全量价格(分位数)
     n_seen = n_valid = 0

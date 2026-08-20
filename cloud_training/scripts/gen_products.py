@@ -26,6 +26,7 @@ from llm_client import TeacherLLM
 SEED = 42
 N_PRODUCTS = 5000
 N_FAKE = 250
+PURE_BATCH = 25  # pure 模式每批条数(4096 tokens 上限下避免 JSON 截断)
 PLATFORMS = ["jd", "taobao", "pdd", "amazon"]
 CATEGORIES = {
     "3c": ["smartphone", "laptop", "headphone", "tablet", "camera"],
@@ -118,16 +119,7 @@ def validate_product(item: dict, cat: str, pid: int) -> dict | None:
 def load_seed_mode(llm: TeacherLLM, rng: random.Random) -> list[dict]:
     """种子模式:读 seeds,LLM 批量补全 description/attributes(断点续传)"""
     seed_dir = DATA/"seeds"
-    seeds = []
-    for cat in CATEGORIES:
-        path = seed_dir / f"{cat}.jsonl"
-        if not path.exists():
-            raise FileNotFoundError(f"seed file missing: {path}")
-        rows = [json.loads(l) for l in open(path, encoding="utf-8")]
-        if len(rows) < MIN_SEED_LINES:
-            raise ValueError(f"seed {path} only {len(rows)} lines < {MIN_SEED_LINES}")
-        seeds.extend(rows[: N_PRODUCTS // len(CATEGORIES)])
-    # 均衡四类目至 5000
+    # 均衡四类目至 5000（含校验：文件缺失/行数不足会抛 FileNotFoundError/ValueError）
     per_cat = N_PRODUCTS // len(CATEGORIES)
     seeds = []
     for cat in CATEGORIES:
@@ -185,16 +177,16 @@ def load_seed_mode(llm: TeacherLLM, rng: random.Random) -> list[dict]:
 
 
 def load_pure_mode(llm: TeacherLLM, rng: random.Random) -> list[dict]:
-    """纯 LLM 兜底:PRD 17 v1.0 骨架路径"""
+    """纯 LLM 兜底:PRD 17 v1.0 骨架路径。每批 PURE_BATCH 条,避免 max_tokens 截断。"""
     products: list[dict] = []
     for cat, nouns in CATEGORIES.items():
         for noun in nouns:
-            prompt = PROMPT_PURE.format(n=250, cat=cat, brands=BRANDS[cat])
+            prompt = PROMPT_PURE.format(n=PURE_BATCH, cat=cat, brands=BRANDS[cat])
             items = llm.chat_json_array(prompt, temperature=0.9, max_tokens=4096)
             if not items:
                 print(f"[pure-mode] FAILED batch cat={cat} noun={noun}, "
                       f"filling with template fallback", flush=True)
-            for idx, item in enumerate(items if items else [{} for _ in range(250)]):
+            for idx, item in enumerate(items if items else [{} for _ in range(PURE_BATCH)]):
                 pid = len(products) + 1
                 p = validate_product(item, cat, pid)
                 if p:
@@ -239,27 +231,36 @@ def main():
             return
 
     mode = args.mode
-    if mode == "seed" and not DATA/"seeds".exists():
-        print("[gen_products] seeds missing, fallback to pure mode", flush=True)
+    if mode == "seed" and not (DATA / "seeds").exists():
+        print("[gen_products] seeds dir missing, fallback to pure mode", flush=True)
         mode = "pure"
 
     t0 = time.time()
     llm = TeacherLLM()
     print(f"[gen_products] mode={mode}, model loaded", flush=True)
 
-    products = (load_seed_mode(llm, rng) if mode == "seed"
-                else load_pure_mode(llm, rng))
+    # 种子模式：文件缺失/行数不足时自动落 pure 兜底（任务书异常表要求汇报原因）
+    if mode == "seed":
+        try:
+            products = load_seed_mode(llm, rng)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"[gen_products] seed load failed ({e}); fallback to pure mode",
+                  flush=True)
+            mode = "pure"
+            products = load_pure_mode(llm, rng)
+    else:
+        products = load_pure_mode(llm, rng)
     assert len(products) == N_PRODUCTS, f"products={len(products)} != {N_PRODUCTS}"
     bad_brands = [p for p in products if p["brand"] not in ALL_FAKE_BRANDS]
     assert not bad_brands, f"non-fake brands found: {bad_brands[:3]}"
 
     prices, anti_fake = make_prices_and_antifake(products, rng)
     DATA.mkdir(parents=True, exist_ok=True)
-    with open("data/products.jsonl", "w", encoding="utf-8") as f:
+    with open(DATA/"products.jsonl", "w", encoding="utf-8") as f:
         f.writelines(json.dumps(p, ensure_ascii=False) + "\n" for p in products)
-    with open("data/prices.jsonl", "w", encoding="utf-8") as f:
+    with open(DATA/"prices.jsonl", "w", encoding="utf-8") as f:
         f.writelines(json.dumps(p, ensure_ascii=False) + "\n" for p in prices)
-    with open("data/anti_fake.jsonl", "w", encoding="utf-8") as f:
+    with open(DATA/"anti_fake.jsonl", "w", encoding="utf-8") as f:
         f.writelines(json.dumps(a, ensure_ascii=False) + "\n" for a in anti_fake)
 
     print(f"[gen_products] DONE products={len(products)} prices={len(prices)} "

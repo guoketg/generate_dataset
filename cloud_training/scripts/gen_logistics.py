@@ -53,7 +53,7 @@ def main():
         return
     t0 = time.time()
     tracks = []
-    with open("data/products.jsonl", encoding="utf-8") as f:
+    with open(DATA/"products.jsonl", encoding="utf-8") as f:
         for line in f:
             p = json.loads(line)
             tracks.append(gen_track(f"ORD{p['product_id']:08d}", p["product_id"], rng))

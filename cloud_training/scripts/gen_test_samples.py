@@ -92,8 +92,8 @@ def main():
     random.seed(SEED)
 
     t0 = time.time()
-    products = [json.loads(l) for l in open("data/products.jsonl", encoding="utf-8")]
-    anti_fakes = [json.loads(l) for l in open("data/anti_fake.jsonl", encoding="utf-8")]
+    products = [json.loads(l) for l in open(DATA/"products.jsonl", encoding="utf-8")]
+    anti_fakes = [json.loads(l) for l in open(DATA/"anti_fake.jsonl", encoding="utf-8")]
     font, big_font = load_font(20), load_font(28)
 
     # 1) 订单截图(e2e 前 n_e2e 张命名 e2e_,其余 train_)

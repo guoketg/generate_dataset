@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 |---|---|
-| version | v1.0 |
+| version | v1.1（适配 llama.cpp 推理：替换 Ollama/vLLM 数据生成方案；工作目录改为用户常用目录；长占确认） |
 | updated_at | 2026-08-19 |
 | 适用环境 | 学校 H200 MIG（33 GB VRAM 单实例），SSH 远程执行 |
 | 设计依据 | [prd/17-data-generation.md](prd/17-data-generation.md) v2.0、[prd/18-training-data.md](prd/18-training-data.md) v1.0、[prd/06-function-calling.md](prd/06-function-calling.md) v1.0 |
@@ -15,18 +15,18 @@
 ## 0. 执行约定与硬约束
 
 **工作约定**：
-- 工作目录 `~/cloud-training/`；仓库（至少 `prd/`、本文件）已同步至 `~/TicketAutomationPlatform/`。
+- 工作目录：**用户常用目录**（用户要求能直接看到代码，不放根目录式隐蔽路径）。首次汇报必须报告实际工作目录；脚本/配置/数据必须同根（相对路径依赖）。
 - 按阶段推进：D0 → D11。**D3 / D6 / D11 三个归档点必须暂停**，向用户汇报并确认 tar 已回传本地后才继续。
 - 所有脚本：随机种子固定 42、幂等可重跑、进度与失败行号打印到 stdout（重定向日志文件，禁止 print 写文件）。
-- 长任务一律跑在 `tmux` 会话内（防 SSH 断连），会话名按阶段命名：`ollama`、`datagen`、`train`。
+- 长任务一律跑在 `tmux` 会话内（防 SSH 断连），会话名按阶段命名：`infer`、`datagen`、`train`。
 
 **硬约束（违反任意一条即任务失败）**：
 1. **零付费 API**：唯一 LLM 为本地推理的 `qwen3.8:27b`（数据生成）与 `Qwen/Qwen3.5-VL-4B`（训练）。
 2. **不爬取真实电商平台**（淘宝/京东/亚马逊页面）。真实感种子仅限 Amazon Reviews 2023 学术开源元数据。
-3. **thinking 模式全程关闭**：Ollama 请求 `options` 中显式关闭；vLLM 请求关闭思考段输出。
-4. **密钥不入代码、不入 git**：`UNSPLASH_ACCESS_KEY` 仅写 `~/cloud-training/.env`（用户提供）。
-5. 任一时刻 GPU 上**只加载一个大模型**（27b 生成相位与 4b 训练相位严格串行）。
-6. 遇本任务书未覆盖的决策：选保守方案、记录到 `~/cloud-training/decisions.log`、汇报时说明，不擅自扩大范围。
+3. **thinking 模式全程关闭**（原因：训练-推理格式一致性 + 批量成本 + GRPO rollout 预算 + 小模型 overthinking）：推理走服务器现有 llama.cpp `llama-server`（OpenAI 兼容 API），请求体加 `"chat_template_kwargs": {"enable_thinking": false}`；该版本不支持时兜底 `/no_think` 软开关 + `response_format: {"type": "json_object"}` 双保险；仍混入则在解析层剥离 `<think>...</think>`。D0 冒烟必须验证响应无 `<think>` 段。
+4. **密钥不入代码、不入 git**：`UNSPLASH_ACCESS_KEY` 仅写 `<工作目录>/.env`（用户提供，权限 600）。
+5. 任一时刻 GPU 上**只加载一个大模型**（27b 生成相位与 4b 训练相位严格串行；SFT 启动前先停 llama-server 释放显存）。
+6. 遇本任务书未覆盖的决策：选保守方案、记录到 `<工作目录>/decisions.log`、汇报时说明，不擅自扩大范围。
 
 ---
 
@@ -43,7 +43,7 @@
 
 超支兜底序（按序触发）：砍扩量（SFT 20k 定稿）→ 砍 GRPO 轮数（保 ≥1 轮全量）→ GRPO 迁自租 5090。硬保底：D6 的 SFT checkpoint + 数据 tar 落袋。
 
----S
+---
 
 ## 2. D0 环境预检
 
@@ -65,20 +65,20 @@ curl -sI "https://api.unsplash.com/photos/random?client_id=$UNSPLASH_ACCESS_KEY"
 curl -sI https://hf-mirror.com | head -1                                                     # 期望 200/301
 # Amazon Reviews 2023 元数据源可达性（McAuley Lab 或镜像，见 prd/17 5.3.2）
 
-# 5. 安装 Ollama 并拉 Teacher 模型（tmux 会话 ollama 内）
-curl -fsSL https://ollama.com/install.sh | sh
-export CUDA_VISIBLE_DEVICES=MIG-<nvidia-smi -L 查到的 UUID>
-ollama serve &          # 必须在 tmux 内
-ollama pull qwen3.8:27b   # Q4_K_M，约 17 GB 下载
-ollama list             # 验证
-curl http://localhost:11434/api/tags
+# 5. 使用服务器现有 llama.cpp（tmux 会话 infer 内启动；不装 Ollama）
+llama-server --version                  # 探明版本与二进制位置
+ls <部署目录>/models/                    # 确认 Qwen3.8-27B GGUF 与 mmproj（视觉投影器）是否就位
+# 模型缺失则从 hf-mirror 下载 Q4_K_M GGUF（约 17 GB）+ 对应 mmproj GGUF
+CUDA_VISIBLE_DEVICES=MIG-<nvidia-smi -L 查到的 UUID> llama-server \
+  -m <qwen3.8-27b-Q4_K_M>.gguf --mmproj <mmproj>.gguf \
+  --jinja --ctx-size 32768 --parallel 8 --cont-batching --port 8080
 ```
 
 **D0 验收清单**：
 - [ ] MIG 33 GB 设备可见，driver/CUDA 达标
 - [ ] 磁盘 ≥ 60 GB
 - [ ] Unsplash / hf-mirror / Amazon 种子源至少两个可达（全不可达立即汇报）
-- [ ] `ollama list` 含 `qwen3.8:27b`；冒烟：发一条关闭 thinking 的 JSON 生成请求并成功解析
+- [ ] llama-server 就绪（:8080），**三项冒烟全过**：(a) `enable_thinking=false` 生效，响应无 `<think>` 段；(b) 带 `tools` 的请求返回合法 `tool_calls`（验证 `--jinja`）；(c) 带图请求（base64 image_url）正常描述图片（验证 mmproj）。任一失败走异常表
 - [ ] `.env` 已写入 `UNSPLASH_ACCESS_KEY`（权限 600）
 
 ---
@@ -108,7 +108,7 @@ ruff>=0.5
 | 脚本 | 规格 | PRD 依据 |
 |---|---|---|
 | `fetch_amazon_seeds.py` | 流式解析 Amazon Reviews 2023 元数据（bz2/json.gz 流式，不全量下载）；每类目采样 ~1300 条（title/price/category）；真实品牌正则替换为虚构品牌表；价格按类目 1%/99% 分位裁剪；输出 `data/seeds/*.jsonl` | 17 5.3.2 种子路径 |
-| `gen_products.py` | 双模式：`--mode seed`（种子改写 + 27b 仅补全 description/attributes）与 `--mode pure`（纯 LLM 兜底）；输出 products/prices/anti_fake 三份 JSONL；Ollama 请求关闭 thinking；`extract_json_array` 容错提取 | 17 5.3.2（代码骨架已给全） |
+| `gen_products.py` | 双模式：`--mode seed`（种子改写 + 27b 仅补全 description/attributes）与 `--mode pure`（纯 LLM 兜底）；输出 products/prices/anti_fake 三份 JSONL；调 llama-server `/v1/chat/completions`（`response_format: json_object` + 关 thinking）；`extract_json_array` 容错提取 | 17 5.3.2（代码骨架已给全） |
 | `gen_logistics.py` | 读 products.jsonl，每 SKU 一单，4-6 轨迹点覆盖 5 状态 | 17 5.3.3（骨架已给全） |
 | `gen_refunds.py` | 5 状态 × 100 = 500 行 | 17 5.3.4（骨架已给全） |
 | `gen_test_samples.py` | PIL 合成订单截图/防伪码图/瑕疵图；**参数化 `--n-e2e 20 --n-train 800`**（PRD 骨架中 N_E2E/N_TRAIN 为占位，必须实现为 argparse 参数） | 17 5.3.5 |
@@ -120,7 +120,7 @@ ruff>=0.5
 |---|---|---|
 | `gen_questions.py` | 模板出题器。内置题干模板库：每路由 ≥ 15 种句式 × 槽位变体（单号/金额/平台/状态词随机填充）。读 17 资产 JSONL，输出构造题池：`{id, route, difficulty, messages(含图), gold, n_ref, gold_actions, split}`。`split` 字段做 train/eval 资产分区（product_id/order_id 空间互斥）。`--adversarial` 模式按 prd/18 5.5 十类配比生成对抗池 `data/adversarial/pool.jsonl`（3600 条，类目量按 18 5.5 表） | 金标随题生成且 100% 机器可判；train/eval 分区无交集（脚本自检断言） |
 | `teacher_questions.py` | Teacher 出题：调 27b 按场景卡（路由组合 + 资产采样）出题，要求链长 ≥ 3、跨 ≥ 2 路由；模板校验器验证 gold 可判后入库 | 3000 题，校验通过率 > 80% |
-| `run_teacher.py` | Teacher 轨迹采样：优先 vLLM OpenAI 兼容服务（并发 8-16），Ollama 兜底。注入 system（prd/06 5.11 模板）+ tools.json + user 题（含图）→ 采 tool_calls → `train_executor.py` 真实执行回填 Observation → 循环至终答（MAX_TOOL_LOOP=5）。每题 2 候选（temperature 0.7） | 采样 ~12k，单条轨迹 ≤ 8k tokens |
+| `run_teacher.py` | Teacher 轨迹采样：调 llama-server（`--parallel 8 --cont-batching` 已提供服务端并发，httpx 异步客户端并发 8-16）。注入 system（prd/06 5.11 模板）+ tools.json + user 题（含图）→ 采 tool_calls → `train_executor.py` 真实执行回填 Observation → 循环至终答（MAX_TOOL_LOOP=5）。每题 2 候选（temperature 0.7）。**依赖 D0 冒烟 (b) 通过**（llama.cpp 原生 tool call） | 采样 ~12k，单条轨迹 ≤ 8k tokens |
 | `train_executor.py` | 训练态工具执行器（双形态之训练态，规格见 prd/06 5.10）：读 17 全部 JSONL 建内存索引（< 50 MB），实现 11 工具真实执行语义；Observation 信封按 prd/06 5.4；参数溯源校验按 prd/06 5.5 | 每工具 ≥ 3 个手工用例通过（正常/参数缺失/溯源违规拒绝） |
 | `filter_trajectories.py` | 四道闸（prd/18 5.2.4）：格式（JSON/工具名∈11/Schema/tool_call_id 配对）→ 溯源 → 金标（复用 cs_reward 判分，R_answer ≥ 0.5 且 R_format = 1）→ 去重与语言（MinHash、中文题中文答、≤ 8k tokens）；输出过滤统计（各闸剔除量、yield、路由分布） | yield 与剔除统计落盘 `data/sft/filter_stats.json` |
 | `build_eval.py` | 评测集组装：业务×难度矩阵（prd/18 5.6：售前 200/物流 230/退款 230/防伪 160/对抗 180；单跳 400/双跳 350/三跳+ 250）；文件头含 version/date/题目哈希；与训练题资产分区互斥 | `data/eval/eval_v1.0.jsonl` 1000 行，分区互斥断言通过 |
@@ -138,7 +138,7 @@ ruff>=0.5
 执行序（GPU 任务与 CPU/IO 任务并行排布）：
 
 ```text
-tmux: ollama     → ollama serve 持续运行（27b 已加载）
+tmux: infer      → llama-server 持续运行（27b 已加载，--parallel 8 --cont-batching）
 tmux: datagen-1  → fetch_product_images.py（纯网络/CPU，3.5h 量级，与 GPU 任务并行）
 tmux: datagen-2  → fetch_amazon_seeds.py（网络下载，并行）
 之后串行：
@@ -157,7 +157,7 @@ tmux: datagen-2  → fetch_amazon_seeds.py（网络下载，并行）
 **D3 归档**（必停点）：
 
 ```bash
-cd ~/cloud-training && tar czf cs_dataset.tar.gz data/ scripts/ config/ requirements-cloud.txt
+cd <WORKDIR> && tar czf cs_dataset.tar.gz data/ scripts/ config/ requirements-cloud.txt
 # 汇报 tar 路径与体积（预期 <= 1 GB，不含 800/类训练合成图时约 500 MB）
 # 等待用户确认已下载回本地，才进入阶段 5
 ```
@@ -173,8 +173,8 @@ cd ~/cloud-training && tar czf cs_dataset.tar.gz data/ scripts/ config/ requirem
    → 5k 纯 VQA 直接转 messages；3k 工具化改造（合成一次 ocr/vl_describe 调用）
 2. gen_questions.py（构造题池：常规 4800 + 预留题池给 Teacher + 对抗池 3600）
 3. 电商构造 6000 轨迹：构造题 → train_executor 真实执行 → 金标模板终答（句式随机化）
-4. vLLM 起 27b 服务（tmux: teacher）→ run_teacher.py 采样 ~12k → filter 留 6000
-   vLLM 起不来则回退 Ollama（OLLAMA_NUM_PARALLEL=8），时间表顺延 ≤ 0.5 天
+4. llama-server 起 27b 服务（tmux: infer，`--parallel 8 --cont-batching`）→ run_teacher.py 采样 ~12k → filter 留 6000
+   若 D0 冒烟 (b) 未过（tool call 不可用）：按异常表升级 llama.cpp → 仍不行装 vLLM 仅服务轨迹采样，顺延 ≤ 0.5 天
 5. teacher_questions.py 高难题 3000 + 构造多跳 3000 + 对抗陷阱 2000 → data/rl/prompts.jsonl
 6. build_eval.py → 导出评测候选题 → 【用户确认节点】高风险/对抗题 100% 过目，
    普通题抽检 20-30%，歧义题剔除补位 → eval_v1.0.jsonl 定稿
@@ -194,7 +194,7 @@ cd ~/cloud-training && tar czf cs_dataset.tar.gz data/ scripts/ config/ requirem
 ## 6. D6-D8 SFT 训练（prd/18 5.7）
 
 ```bash
-# 先卸载 27b 与数据生成服务，显存让位（硬约束 5）
+# 先停 llama-server 释放显存（硬约束 5）；训练环境由 ms-swift 管理（自带 torch / vLLM rollout），与 llama.cpp 无关
 swift sft \
   --model Qwen/Qwen3.5-VL-4B \
   --dataset data/sft/public_qa.jsonl data/sft/ecommerce.jsonl data/sft/trajectories.jsonl \
@@ -272,20 +272,22 @@ tar czf cs_final.tar.gz output/ data/ scripts/ config/ decisions.log
 | Unsplash/网络源学校不可达 | 本地拉取后 scp 上传（图片下载不占 GPU） |
 | Amazon 种子下载/解析失败 | `gen_products.py --mode pure` 纯 LLM 兜底（多耗 8-15h，需汇报顺延） |
 | 27b 输出非 JSON | `extract_json_array` 容错 + 重试 3 次；仍失败记录失败行号继续 |
-| thinking 拖慢单条耗时翻倍 | 检查请求 options 是否显式关闭（硬约束 3） |
-| vLLM 起 27b 失败（MIG 兼容） | 回退 Ollama + `OLLAMA_NUM_PARALLEL=8`，顺延 ≤ 0.5 天 |
+| thinking 拖慢单条耗时翻倍 | 检查 `chat_template_kwargs` 是否生效（硬约束 3）；老版本改用 `/no_think` + json grammar |
+| llama.cpp tool call 不工作（`--jinja` 未生效/版本老） | 依序：确认 `--jinja` 已加 → 升级 llama.cpp → 装 vLLM 仅服务轨迹采样（出题与结构化生成不受影响，走 `response_format`） |
+| 响应混入 `<think>` 段 | `chat_template_kwargs` 不被支持 → `/no_think` 软开关 + json grammar 双保险 → 解析层剥离 |
+| mmproj 缺失 / 多模态不可用 | 从 hf-mirror 下载对应 mmproj GGUF；仍不可用则轨迹采样换 vLLM/Ollama 兜底 |
 | Teacher yield < 30% | 检查 system 模板注入；每题 3 候选；仍低提高电商构造占比并汇报 |
 | GRPO colocate OOM | 按 7 节处置序降配 |
 | cs_reward 与离线判分不一致 | 以单测为准修 reward；已训数据不回滚 |
 | 窗口整体超支 | 按 1 节兜底序执行并汇报 |
-| Slurm/平台 max job time 截断 | tmux + nohup 常驻；若平台强制回收，按归档点续跑（脚本幂等，可从断点恢复） |
+| SSH 断连 | 服务器可长期占用（用户已确认）；所有服务与长任务仍须 tmux 内跑，断连后 `tmux attach` 恢复，脚本幂等支持断点续跑 |
 
 ---
 
-## 11. 目录契约（终态）
+## 11. 目录契约（终态，`<WORKDIR>` 为用户常用目录，D0 首次汇报确认）
 
 ```text
-~/cloud-training/
+<WORKDIR>/
 ├── config/tools/tools.json
 ├── data/
 │   ├── seeds/ products.jsonl prices.jsonl anti_fake.jsonl logistics.jsonl refunds.jsonl
