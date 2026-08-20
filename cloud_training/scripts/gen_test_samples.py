@@ -73,13 +73,90 @@ def gen_anti_fake_image(code: str, product_id: int, path: Path, font):
 
 
 def gen_defect_image(product_img_path: Path, defect_type: tuple, path: Path):
-    """瑕疵图:商品图 + 红框标注(红框位置即瑕疵位置,元数据落盘)"""
+    """瑕疵图:商品图 + 真实缺陷 + 红框标注(红框位置即瑕疵位置,元数据落盘)"""
     img = Image.open(product_img_path).convert("RGB").resize((400, 400))
     draw = ImageDraw.Draw(img)
-    x, y = random.randint(50, 270), random.randint(50, 270)
-    draw.rectangle([x, y, x + 80, y + 80], outline="red", width=4)
+    
+    # 确定缺陷位置（在商品主体区域，避免边缘）
+    x, y = random.randint(80, 280), random.randint(80, 280)
+    defect_w, defect_h = random.randint(60, 100), random.randint(60, 100)
+    
+    # 根据缺陷类型添加真实缺陷
+    defect_name = defect_type[0] if isinstance(defect_type, tuple) else defect_type
+    
+    if "开胶" in defect_name:
+        # 开胶：画一条不规则的裂缝线
+        points = []
+        for i in range(10):
+            px = x + i * (defect_w // 10) + random.randint(-5, 5)
+            py = y + random.randint(-3, 3)
+            points.append((px, py))
+        draw.line(points, fill="black", width=3)
+        # 添加一些胶水痕迹
+        for _ in range(5):
+            gx, gy = x + random.randint(0, defect_w), y + random.randint(0, defect_h)
+            draw.ellipse([gx-2, gy-2, gx+2, gy+2], fill="yellow", outline="orange")
+    
+    elif "划痕" in defect_name:
+        # 划痕：画一条斜线
+        x1, y1 = x, y
+        x2, y2 = x + defect_w, y + defect_h
+        draw.line([(x1, y1), (x2, y2)], fill="gray", width=2)
+        # 添加划痕边缘的毛刺
+        for i in range(5):
+            sx = x1 + (x2 - x1) * i // 5 + random.randint(-3, 3)
+            sy = y1 + (y2 - y1) * i // 5 + random.randint(-3, 3)
+            draw.line([(sx, sy), (sx + random.randint(-5, 5), sy + random.randint(-5, 5))], 
+                     fill="darkgray", width=1)
+    
+    elif "污渍" in defect_name:
+        # 污渍：画一个不规则的污渍
+        for _ in range(20):
+            sx = x + random.randint(0, defect_w)
+            sy = y + random.randint(0, defect_h)
+            size = random.randint(3, 8)
+            color = random.choice(["brown", "darkgreen", "darkred", "gray"])
+            draw.ellipse([sx-size, sy-size, sx+size, sy+size], fill=color)
+        # 添加污渍边缘
+        for _ in range(10):
+            sx = x + random.randint(0, defect_w)
+            sy = y + random.randint(0, defect_h)
+            draw.line([(sx, sy), (sx + random.randint(-10, 10), sy + random.randint(-10, 10))], 
+                     fill="brown", width=1)
+    
+    elif "色差" in defect_name:
+        # 色差：画一个颜色不同的区域
+        color_diff = random.choice(["lightblue", "lightgreen", "pink", "lightyellow"])
+        draw.rectangle([x, y, x + defect_w, y + defect_h], fill=color_diff, outline=color_diff)
+        # 添加一些纹理
+        for _ in range(15):
+            sx = x + random.randint(0, defect_w)
+            sy = y + random.randint(0, defect_h)
+            draw.point((sx, sy), fill="white")
+    
+    elif "破损" in defect_name:
+        # 破损：画一个破洞效果
+        # 外层深色
+        draw.ellipse([x, y, x + defect_w, y + defect_h], fill="black")
+        # 内层灰色
+        draw.ellipse([x+5, y+5, x + defect_w-5, y + defect_h-5], fill="darkgray")
+        # 破损边缘
+        for _ in range(10):
+            angle = random.uniform(0, 2 * 3.14159)
+            r = random.randint(defect_w//2 - 5, defect_w//2 + 5)
+            ex = int(x + defect_w/2 + r * __import__('math').cos(angle))
+            ey = int(y + defect_h/2 + r * __import__('math').sin(angle))
+            draw.line([(x + defect_w//2, y + defect_h//2), (ex, ey)], fill="black", width=2)
+    
+    else:
+        # 默认：画一个标记
+        draw.rectangle([x, y, x + defect_w, y + defect_h], fill="red", outline="darkred")
+    
+    # 最后画红框标注缺陷位置
+    draw.rectangle([x, y, x + defect_w, y + defect_h], outline="red", width=4)
+    
     img.save(path, quality=88)
-    return {"x": x, "y": y, "w": 80, "h": 80}
+    return {"x": x, "y": y, "w": defect_w, "h": defect_h, "defect_type": defect_name}
 
 
 def main():
@@ -152,7 +229,7 @@ def main():
     d = DATA/"images/defects"
     d.mkdir(parents=True, exist_ok=True)
     meta_path = d / "meta.jsonl"
-    product_imgs = sorted(DATA/"images/products".glob("*.jpg"))
+    product_imgs = sorted((DATA/"images/products").glob("*.jpg"))
     if not product_imgs:
         print("[defects] WARN: no product images yet, run "
               "fetch_product_images.py first; skip defects", flush=True)

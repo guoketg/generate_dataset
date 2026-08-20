@@ -4,3 +4,4 @@ models/
 __pycache__/
 .env
 data/
+*.zip
