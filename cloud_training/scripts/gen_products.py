@@ -41,7 +41,7 @@ BRANDS = {
     "food": ["BeanVista", "SnackHive", "OrchardGold", "SteepLeaf", "CocoaRidge"],
 }
 ALL_FAKE_BRANDS = {b for bs in BRANDS.values() for b in bs}
-BATCH_SIZE = 50
+BATCH_SIZE = 32  # 降批大小:server n_ctx=4096 下避免输出截断导致 JSON 不完整
 MIN_SEED_LINES = 1250
 
 PROMPT_PURE = """You are an e-commerce product data generator. Output strict JSON only, no markdown.
@@ -116,8 +116,13 @@ def validate_product(item: dict, cat: str, pid: int) -> dict | None:
     }
 
 
-def load_seed_mode(llm: TeacherLLM, rng: random.Random) -> list[dict]:
-    """种子模式:读 seeds,LLM 批量补全 description/attributes(断点续传)"""
+def load_seed_mode(llm: TeacherLLM, rng: random.Random,
+                   concurrency: int = 1) -> list[dict]:
+    """种子模式:读 seeds,LLM 批量补全 description/attributes(断点续传)。
+
+    concurrency>1 时用线程池并发提交批次(单 slot server 下为快进快出,
+    多实例 server 下真正并行)。断点续传基于 products.partial.jsonl。
+    """
     seed_dir = DATA/"seeds"
     # 均衡四类目至 5000（含校验：文件缺失/行数不足会抛 FileNotFoundError/ValueError）
     per_cat = N_PRODUCTS // len(CATEGORIES)
@@ -146,7 +151,9 @@ def load_seed_mode(llm: TeacherLLM, rng: random.Random) -> list[dict]:
               f"({done_batches} batches)", flush=True)
 
     n_batches = (len(seeds) + BATCH_SIZE - 1) // BATCH_SIZE
-    for b in range(done_batches, n_batches):
+
+    def process_batch(b: int) -> tuple[int, list[dict]]:
+        """处理第 b 批,返回 (batch_index, products)。"""
         chunk = seeds[b * BATCH_SIZE:(b + 1) * BATCH_SIZE]
         items_txt = "\n".join(
             f"{i} | {s['category']} | {s['brand']} | {s['title']}"
@@ -158,20 +165,39 @@ def load_seed_mode(llm: TeacherLLM, rng: random.Random) -> list[dict]:
         for it in arr:
             if isinstance(it, dict) and "index" in it:
                 desc_map[int(it["index"])] = it
+        batch_products = []
         for i, s in enumerate(chunk):
             pid = b * BATCH_SIZE + i + 1
             d = desc_map.get(i, {})
-            products.append({
+            batch_products.append({
                 "product_id": pid, "title": s["title"], "category": s["category"],
                 "brand": s["brand"], "model": f"M{pid:05d}",
                 "price": s["price"], "platform": "jd",
                 "description": str(d.get("description", ""))[:120],
                 "attributes": d.get("attributes") or {},
             })
-        with open(partial, "w", encoding="utf-8") as f:
-            f.writelines(json.dumps(p, ensure_ascii=False) + "\n" for p in products)
-        print(f"[seed-mode] batch {b + 1}/{n_batches} done, total={len(products)}",
-              flush=True)
+        return b, batch_products
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results: dict[int, list[dict]] = {}
+    done_count = 0
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
+        futures = {ex.submit(process_batch, b): b
+                   for b in range(done_batches, n_batches)}
+        for fut in as_completed(futures):
+            b, bp = fut.result()
+            results[b] = bp
+            done_count += 1
+            # 按序把已完成批次写入 partial(保证断点续传顺序正确)
+            while done_batches in results:
+                products.extend(results.pop(done_batches))
+                done_batches += 1
+                with open(partial, "w", encoding="utf-8") as f:
+                    f.writelines(json.dumps(p, ensure_ascii=False) + "\n"
+                                 for p in products)
+                print(f"[seed-mode] batch {done_batches}/{n_batches} done, "
+                      f"total={len(products)}", flush=True)
     partial.unlink(missing_ok=True)
     return products[:N_PRODUCTS]
 
@@ -216,15 +242,19 @@ def load_pure_mode(llm: TeacherLLM, rng: random.Random) -> list[dict]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["seed", "pure"], default="seed")
+    ap.add_argument("--llm-base-url", default=None,
+                    help="Teacher OpenAI 兼容服务地址;省略则进程内加载 GGUF")
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="并发批次数(仅 server 模式有意义;单 slot 下退化为快进快出)")
     args = ap.parse_args()
 
     rng = random.Random(SEED)
     random.seed(SEED)
 
     # 幂等:三产物齐备即跳过
-    if (DATA/"products.jsonl".exists()
-            and DATA/"prices.jsonl".exists()
-            and DATA/"anti_fake.jsonl".exists()):
+    if ((DATA/"products.jsonl").exists()
+            and (DATA/"prices.jsonl").exists()
+            and (DATA/"anti_fake.jsonl").exists()):
         n = sum(1 for _ in open("data/products.jsonl", encoding="utf-8"))
         if n >= N_PRODUCTS:
             print("[gen_products] outputs exist, skip (idempotent)", flush=True)
@@ -236,13 +266,16 @@ def main():
         mode = "pure"
 
     t0 = time.time()
-    llm = TeacherLLM()
-    print(f"[gen_products] mode={mode}, model loaded", flush=True)
+    llm = TeacherLLM(base_url=args.llm_base_url)
+    backend = "server" if args.llm_base_url else "in-process"
+    print(f"[gen_products] mode={mode}, backend={backend}"
+          f"{f', concurrency={args.concurrency}' if args.llm_base_url else ''}",
+          flush=True)
 
     # 种子模式：文件缺失/行数不足时自动落 pure 兜底（任务书异常表要求汇报原因）
     if mode == "seed":
         try:
-            products = load_seed_mode(llm, rng)
+            products = load_seed_mode(llm, rng, concurrency=args.concurrency)
         except (FileNotFoundError, ValueError) as e:
             print(f"[gen_products] seed load failed ({e}); fallback to pure mode",
                   flush=True)

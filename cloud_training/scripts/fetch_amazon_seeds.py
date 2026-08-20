@@ -78,7 +78,12 @@ def iter_records(cat: str):
     url = BASE + CATEGORIES[cat]
     with httpx.stream("GET", url, timeout=60, follow_redirects=True) as resp:
         resp.raise_for_status()
-        gz = gzip.GzipFile(fileobj=io.BufferedReader(resp.raw))
+        # httpx.Response 无 .raw(那是 requests 的属性),改用 iter_bytes 流式累积
+        buf = io.BytesIO()
+        for chunk in resp.iter_bytes():
+            buf.write(chunk)
+        buf.seek(0)
+        gz = gzip.GzipFile(fileobj=buf)
         for i, line in enumerate(io.TextIOWrapper(gz, encoding="utf-8", errors="ignore")):
             yield i, line
 

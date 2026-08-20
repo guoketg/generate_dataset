@@ -24,7 +24,7 @@ from llama_cpp.llama_chat_format import Jinja2ChatFormatter
 
 # 动态定位仓库根目录:本文件位于 <root>/cloud_training/scripts/llm_client.py
 _ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MODEL = str(_ROOT / "models" / "Qwen3.8-27B-UD-Q4_K_XL.gguf")
+DEFAULT_MODEL = str(_ROOT / "models" / "Qwen3.5-4B-Q4_K_M.gguf")
 MAX_RETRIES = 3
 
 TOOL_CALL_RE = re.compile(
@@ -64,11 +64,52 @@ def parse_qwen_tool_calls(text: str) -> list[dict]:
     return calls
 
 
-def extract_json_array(text: str) -> list:
-    """容错提取 JSON 数组:剥离 think/markdown 代码块后取最后一个 [...]"""
+def _extract_json_array_robust(text: str) -> list:
+    """用 JSONDecoder.raw_decode 容错解析数组,兼容前缀/后缀/截断。
+
+    策略:剥离 think/markdown -> 找最外层 '[' 到匹配 ']' -> raw_decode。
+    若完整解析失败,尝试逐步截掉尾部字符修复(处理 max_tokens 截断)。
+    """
     text = strip_think(text)
-    text = re.sub(r"```(?:json)?", "", text)
-    matches = re.findall(r"\[\s*\{.*?\}\s*\]", text, flags=re.DOTALL)
+    text = re.sub(r"```(?:json)?", "", text).strip()
+    # 找到第一个 '[' 及其后最后的 ']'
+    start = text.find("[")
+    if start == -1:
+        return []
+    end = text.rfind("]")
+    if end <= start:
+        return []
+    candidate = text[start:end + 1]
+    dec = json.JSONDecoder()
+    try:
+        obj, _ = dec.raw_decode(candidate)
+        if isinstance(obj, list):
+            return obj
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # 修复尾部截断:逐步回退到上一个 '}' 形成完整数组
+    for i in range(len(candidate), start, -1):
+        sub = candidate[start:i]
+        if not sub.endswith("}"):
+            continue
+        try:
+            obj, _ = dec.raw_decode(sub + "]")
+            if isinstance(obj, list) and obj:
+                return obj
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return []
+
+
+def extract_json_array(text: str) -> list:
+    """容错提取 JSON 数组(优先完整,失败则尾部修复)。返回 [] 表示彻底失败。"""
+    res = _extract_json_array_robust(text)
+    if res:
+        return res
+    # 兜底:原正则(处理极简情况)
+    text2 = strip_think(text)
+    text2 = re.sub(r"```(?:json)?", "", text2)
+    matches = re.findall(r"\[\s*\{.*?\}\s*\]", text2, flags=re.DOTALL)
     if not matches:
         return []
     try:
@@ -93,17 +134,28 @@ def extract_json_object(text: str) -> dict | None:
 
 
 class TeacherLLM:
-    """进程内单例 Teacher。单序列同步推理(~13 tok/s);
-    高并发场景请用 llama-server OpenAI 兼容服务(见 run_teacher.py)。"""
+    """Teacher 模型客户端。两种后端:
+    - base_url=None:进程内加载 GGUF(Llama),单序列同步推理。
+    - base_url=...:走 OpenAI 兼容 HTTP(llama-server,见 run_teacher.py)。
+
+    注意:本机 MIG 35GB + llama_cpp 0.3.35 下单实例单 slot,server 端并发请求
+    会排队串行,吞吐 ≈ 进程内。并发仅在多 server 实例(多 GPU)时有意义。
+    """
 
     def __init__(self, model_path: str = DEFAULT_MODEL, n_ctx: int = 8192,
-                 n_gpu_layers: int = -1, verbose: bool = False):
+                 n_gpu_layers: int = -1, verbose: bool = False,
+                 base_url: str | None = None):
+        self.base_url = base_url
+        self.n_calls = 0
+        if base_url:
+            import httpx
+            self._http = httpx.Client(base_url=base_url, timeout=600.0)
+            return
         self.llm = Llama(
             model_path=model_path, n_gpu_layers=n_gpu_layers,
             n_ctx=n_ctx, n_batch=512, verbose=verbose,
         )
         self._patch_no_think()
-        self.n_calls = 0
 
     def _patch_no_think(self) -> None:
         """覆盖 _chat_handlers['chat_template.default'] 为 no-think 模板。
@@ -139,6 +191,20 @@ class TeacherLLM:
         content 已剥离 <think> 段。
         """
         self.n_calls += 1
+        if self.base_url:
+            payload = {
+                "messages": messages, "temperature": temperature,
+                "max_tokens": max_tokens, "stream": False,
+            }
+            if tools:
+                payload["tools"] = tools
+            r = self._http.post("/v1/chat/completions", json=payload)
+            r.raise_for_status()
+            msg = r.json()["choices"][0]["message"]
+            content = msg.get("content") or ""
+            content = strip_think(content)
+            calls = parse_qwen_tool_calls(content)
+            return {"content": content, "tool_calls": calls}
         kwargs = dict(
             messages=messages, temperature=temperature,
             max_tokens=max_tokens,
@@ -154,7 +220,11 @@ class TeacherLLM:
 
     def chat_json_array(self, prompt: str, temperature: float = 0.9,
                         max_tokens: int = 4096, retries: int = MAX_RETRIES) -> list:
-        """生成 JSON 数组(gen_products 等),失败重试(指数退避),终败返回 []"""
+        """生成 JSON 数组(gen_products 等)。
+
+        先尝试一次(增强版 extract_json_array 已能修复大多数截断/格式问题);
+        失败再重试(指数退避),终败返回 []。
+        """
         for attempt in range(retries):
             out = self.chat([{"role": "user", "content": prompt}],
                             temperature=temperature, max_tokens=max_tokens)

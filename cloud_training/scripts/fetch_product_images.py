@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import time
 from pathlib import Path
 
@@ -19,6 +20,14 @@ DATA = _ROOT / "data"
 
 import httpx
 
+# 随机 UA 池,降低 CDN 指纹关联导致的限流/封 IP 风险
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148",
+]
 SEARCH_URL = "https://api.unsplash.com/search/photos"
 QUERIES = {
     "3c": ["smartphone", "laptop", "headphone", "tablet", "camera"],
@@ -50,12 +59,28 @@ async def search_page(client: httpx.AsyncClient, key: str, query: str,
                       page: int, sem: asyncio.Semaphore) -> list[str]:
     async with sem:  # 搜索请求串行(配额敏感:50/h)
         for attempt in range(3):
-            r = await client.get(SEARCH_URL, params={
-                "query": query, "per_page": 30, "page": page, "client_id": key,
-            }, timeout=30)
-            if r.status_code == 429:  # 配额尽:等下一小时窗口
+            try:
+                r = await client.get(SEARCH_URL, params={
+                    "query": query, "per_page": 30, "page": page, "client_id": key,
+                }, timeout=30, headers={"User-Agent": random.choice(_USER_AGENTS)})
+            except httpx.HTTPError as e:
+                wait = (2 ** attempt) * 5 + random.uniform(0, 3)
+                print(f"[search] {query} p{page} http error {e}, "
+                      f"retry in {wait:.1f}s", flush=True)
+                await asyncio.sleep(wait)
+                continue
+            if r.status_code == 429 or r.status_code == 403:
+                # 配额耗尽或临时封禁:等至下一整点窗口再续
                 wait = 3600 - (time.time() % 3600) + 5
-                print(f"[429] quota exhausted, sleep {wait:.0f}s", flush=True)
+                print(f"[search] {query} p{page} http {r.status_code} "
+                      f"(quota/blocked), sleep {wait:.0f}s to next hour",
+                      flush=True)
+                await asyncio.sleep(wait)
+                continue
+            if r.status_code >= 500:  # 服务端错误:短退避重试
+                wait = (2 ** attempt) * 5 + random.uniform(0, 3)
+                print(f"[search] {query} p{page} http {r.status_code}, "
+                      f"retry in {wait:.1f}s", flush=True)
                 await asyncio.sleep(wait)
                 continue
             r.raise_for_status()
@@ -63,25 +88,45 @@ async def search_page(client: httpx.AsyncClient, key: str, query: str,
         return []
 
 
-async def download(client: httpx.AsyncClient, url: str, path: Path) -> bool:
+async def download(client: httpx.AsyncClient, sem: asyncio.Semaphore,
+                   url: str, path: Path) -> bool:
     if path.exists() and path.stat().st_size > 0:
         return True  # 断点续传:已下载跳过
-    try:
-        r = await client.get(url, timeout=60)
-        if r.status_code == 200:
-            path.write_bytes(r.content)
-            return True
-    except httpx.HTTPError as e:
-        print(f"[download] failed {path.name}: {e}", flush=True)
+    # 随机延时打散请求节奏,降低被 CDN 风控的概率
+    await asyncio.sleep(random.uniform(0.1, 0.4))
+    async with sem:  # 限制下载并发
+        for attempt in range(4):
+            try:
+                headers = {"User-Agent": random.choice(_USER_AGENTS)}
+                r = await client.get(url, timeout=60, headers=headers)
+                if r.status_code == 200:
+                    path.write_bytes(r.content)
+                    return True
+                # 429/5xx(含 503 Service Unavailable 封 IP 信号):指数退避后重试
+                if r.status_code in (429, 500, 502, 503, 504):
+                    wait = (2 ** attempt) * 3 + random.uniform(0, 2)
+                    print(f"[download] {path.name} http {r.status_code}, "
+                          f"retry in {wait:.1f}s (attempt {attempt+1}/4)", flush=True)
+                    await asyncio.sleep(wait)
+                    continue
+                print(f"[download] {path.name} unexpected http {r.status_code}",
+                      flush=True)
+                return False
+            except httpx.HTTPError as e:
+                wait = (2 ** attempt) * 3 + random.uniform(0, 2)
+                print(f"[download] failed {path.name}: {e}, retry in {wait:.1f}s",
+                      flush=True)
+                await asyncio.sleep(wait)
     return False
 
 
-async def main(concurrency: int = 8):
+async def main(concurrency: int = 3):
     key = load_env()
     OUT.mkdir(parents=True, exist_ok=True)
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
-    # 搜索串行(配额敏感:50/h); 下载由 asyncio.gather 并发,无需额外信号量
+    # 搜索串行(配额敏感:50/h); 下载由并发信号量限流
     search_sem = asyncio.Semaphore(1)
+    dl_sem = asyncio.Semaphore(concurrency)  # 限制下载并发,降低风控
     total = 0
     t0 = time.time()
     async with httpx.AsyncClient() as client:
@@ -101,7 +146,7 @@ async def main(concurrency: int = 8):
                         if got + j >= PER_WORD:
                             break
                         path = OUT / f"{cat}_{q}_{got + j:04d}.jpg"
-                        tasks.append(download(client, u, path))
+                        tasks.append(download(client, dl_sem, u, path))
                         total += 1
                     results = await asyncio.gather(*tasks)
                     skipped += results.count(False)
@@ -118,5 +163,5 @@ async def main(concurrency: int = 8):
 if __name__ == "__main__":
     import sys
     conc = int(sys.argv[sys.argv.index("--concurrency") + 1]) \
-        if "--concurrency" in sys.argv else 8
+        if "--concurrency" in sys.argv else 3
     asyncio.run(main(conc))
