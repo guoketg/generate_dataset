@@ -41,8 +41,14 @@ class TrainingDataGenerator:
         self.seed = seed
         random.seed(seed)
 
-        # 加载数据资产
-        self.products = self._load_jsonl("products.jsonl")
+        # 加载数据资产（优先使用中文数据）
+        cn_path = Path(data_dir) / "products_cn.jsonl"
+        if cn_path.exists():
+            self.products = self._load_jsonl("products_cn.jsonl")
+            print(f"[gen_training_data] 使用中文产品数据: {len(self.products)} 个", flush=True)
+        else:
+            self.products = self._load_jsonl("products.jsonl")
+            print(f"[gen_training_data] 使用英文产品数据: {len(self.products)} 个", flush=True)
         self.logistics = self._load_jsonl("logistics.jsonl")
         self.anti_fake = self._load_jsonl("anti_fake.jsonl")
         self.refunds = self._load_jsonl("refunds.jsonl")
@@ -75,6 +81,14 @@ class TrainingDataGenerator:
 
         # 初始化训练态执行器（用于真实执行轨迹）
         self.executor = TrainExecutor(data_dir=str(self.data_dir))
+
+        # 缓存图片列表（避免每次 glob 扫描整个目录树）
+        img_dir = self.data_dir / "images"
+        if img_dir.exists():
+            self._cached_images = list(img_dir.glob("**/*.jpg")) + list(img_dir.glob("**/*.png"))
+        else:
+            self._cached_images = []
+        print(f"  图片缓存: {len(self._cached_images)} 张", flush=True)
 
         # 模板库
         self.templates = self._load_templates()
@@ -126,35 +140,365 @@ class TrainingDataGenerator:
     def _sample_search_keyword(self) -> str:
         """从商品标题中采样一个能匹配 text_search 的关键词。"""
         product = random.choice(self.products)
-        words = [w for w in product["title"].split() if len(w) > 3]
-        return random.choice(words) if words else "Headphones"
+        title = product["title"]
+        # 尝试中文分词（按标点和空格分割）
+        import re
+        # 中文：按标点分割，取2-6字的片段
+        cn_segments = re.split(r'[，。、；：！？\s]+', title)
+        cn_words = [w for w in cn_segments if 2 <= len(w) <= 6 and any('\u4e00' <= c <= '\u9fff' for c in w)]
+        if cn_words:
+            return random.choice(cn_words)
+        # 英文回退
+        words = [w for w in title.split() if len(w) > 3]
+        return random.choice(words) if words else "耳机"
 
-    def _sample_order_id(self) -> str:
-        return random.choice(self._real_order_ids)
+    def _sample_order_id(self, used: set = None) -> str:
+        """采样订单号，支持排除已使用的。"""
+        pool = [x for x in self._real_order_ids if not used or x not in used]
+        if not pool:
+            pool = self._real_order_ids
+        choice = random.choice(pool)
+        if used is not None:
+            used.add(choice)
+        return choice
 
-    def _sample_refundable_order_id(self) -> str:
+    def _sample_refundable_order_id(self, used: set = None) -> str:
         """采样一个无活跃退款的订单（供退款创建流程使用）。"""
-        return random.choice(self._refundable_order_ids)
+        pool = [x for x in self._refundable_order_ids if not used or x not in used]
+        if not pool:
+            pool = self._refundable_order_ids
+        choice = random.choice(pool)
+        if used is not None:
+            used.add(choice)
+        return choice
 
-    def _sample_code(self) -> str:
-        return random.choice(self._real_codes)
+    def _sample_code(self, used: set = None) -> str:
+        pool = [x for x in self._real_codes if not used or x not in used]
+        if not pool:
+            pool = self._real_codes
+        choice = random.choice(pool)
+        if used is not None:
+            used.add(choice)
+        return choice
 
-    def _sample_product_id(self) -> int:
-        return random.choice(self._real_product_ids)
+    def _sample_product_id(self, used: set = None) -> int:
+        pool = [x for x in self._real_product_ids if not used or x not in used]
+        if not pool:
+            pool = self._real_product_ids
+        choice = random.choice(pool)
+        if used is not None:
+            used.add(choice)
+        return choice
 
-    def _sample_refund_id(self) -> str:
-        return random.choice(self._real_refund_ids)
+    def _sample_refund_id(self, used: set = None) -> str:
+        pool = [x for x in self._real_refund_ids if not used or x not in used]
+        if not pool:
+            pool = self._real_refund_ids
+        choice = random.choice(pool)
+        if used is not None:
+            used.add(choice)
+        return choice
 
     def _sample_category(self) -> str:
         return random.choice(self._categories)
+
+    def _generate_dynamic_query(self, route: str, params: dict, has_image: bool = False) -> str:
+        """生成动态查询语句，大幅提高多样性"""
+        # 动态前缀/后缀/修饰词（更多变体）
+        prefixes = [
+            "请", "帮我", "麻烦", "能帮我", "可以帮我", "我想", "我要", "帮我一下", "麻烦帮我", "请帮我",
+            "帮我看看", "帮我查查", "帮我搜搜", "帮我找找", "帮我查一下", "帮我搜一下",
+            "麻烦帮我看看", "麻烦帮我查查", "麻烦帮我搜搜", "麻烦帮我找找",
+            "能帮我看看吗", "能帮我查查吗", "能帮我搜搜吗", "能帮我找找吗",
+            "可以帮我看看吗", "可以帮我查查吗", "可以帮我搜搜吗", "可以帮我找找吗",
+            "帮忙", "帮忙看看", "帮忙查查", "帮忙搜搜", "帮忙找找", "帮忙查一下", "帮忙搜一下",
+            "麻烦帮忙", "麻烦帮忙看看", "麻烦帮忙查查", "麻烦帮忙搜搜", "麻烦帮忙找找",
+            "请帮忙", "请帮忙看看", "请帮忙查查", "请帮忙搜搜", "请帮忙找找",
+        ]
+        suffixes = [
+            "谢谢", "急用", "尽快", "谢谢啦", "麻烦了", "感谢", "拜托", "辛苦了", "谢了", "谢啦",
+            "谢谢帮忙", "感谢帮忙", "麻烦了谢谢", "辛苦了谢谢", "拜托了", "谢谢啦",
+            "急用谢谢", "尽快谢谢", "马上谢谢", "立刻谢谢",
+            "谢谢了", "感谢了", "麻烦了", "辛苦了", "拜托了", "谢了",
+            "急用的", "尽快的", "马上要", "立刻要", "赶紧要", "迅速要",
+        ]
+        modifiers = [
+            "快点", "尽快", "马上", "立刻", "赶紧", "迅速", "加急", "优先", "马上处理", "尽快处理",
+            "快一点", "尽快处理", "马上处理", "立刻处理", "赶紧处理", "迅速处理",
+            "加急处理", "优先处理", "马上帮我", "尽快帮我",
+            "帮我快点", "帮我尽快", "帮我马上", "帮我立刻", "帮我赶紧", "帮我迅速",
+            "快点帮我", "尽快帮我", "马上帮我", "立刻帮我", "赶紧帮我", "迅速帮我",
+        ]
+        # 随机附加描述
+        descriptions = [
+            "等了很久了", "好几天了", "一直没更新", "不知道到哪了", "急用",
+            "等不及了", "好久了", "一直没消息", "不知道什么情况", "急着用",
+            "等了好久", "一直没动静", "不知道怎么样了", "急着要", "等不及了",
+            "好几天没更新了", "一直没反应", "不知道进展", "急用的", "等了很久",
+        ]
+        
+        prefix = random.choice(prefixes)
+        suffix = random.choice(suffixes) if random.random() < 0.3 else ""
+        modifier = random.choice(modifiers) if random.random() < 0.2 else ""
+        desc = random.choice(descriptions) if random.random() < 0.15 else ""
+        
+        if "logistics" in route:
+            order_id = params.get("order_id", "ORD000000")
+            templates = [
+                f"{prefix}查一下{order_id}的物流",
+                f"{prefix}看看{order_id}到哪了",
+                f"{prefix}跟踪{order_id}的快递",
+                f"{order_id}的物流帮我查下",
+                f"查下{order_id}走到哪了",
+                f"{order_id}快递到哪了",
+                f"{prefix}看看{order_id}的包裹",
+                f"{order_id}发货没？帮我查查",
+                f"{order_id}预计啥时候到",
+                f"{prefix}查查{order_id}的物流进度",
+                f"{order_id}到哪了？帮我查下",
+                f"{prefix}看看{order_id}的快递到哪了",
+                f"{order_id}的包裹帮我查查",
+                f"{prefix}查下{order_id}的物流信息",
+                f"{order_id}快递帮我跟踪下",
+                f"{prefix}看看{order_id}发货没",
+                f"{order_id}物流帮我查查",
+                f"{prefix}查查{order_id}到哪了",
+                f"{order_id}快递到哪了？帮我看看",
+                f"{prefix}看看{order_id}的物流状态",
+            ]
+            if has_image:
+                img_templates = [
+                    f"[IMG] {prefix}看看这个订单截图，查下物流",
+                    f"[IMG] 这个订单号是多少？{prefix}查下到哪了",
+                    f"[IMG] 我拍了个订单截图，{prefix}查物流",
+                    f"[IMG] {prefix}识别下这个快递单号",
+                    f"[IMG] 这个包裹到哪了？截图给你",
+                    f"[IMG] {prefix}看看这张图里的订单到哪了",
+                    f"[IMG] 订单截图在这，{prefix}查下物流",
+                    f"[IMG] {prefix}看看这个快递单号",
+                    f"[IMG] 这个包裹截图帮我看看",
+                    f"[IMG] {prefix}识别下这个订单",
+                    f"[IMG] 订单号在图里，{prefix}查下",
+                    f"[IMG] {prefix}看看这个物流截图",
+                ]
+                result = random.choice(img_templates)
+                if desc:
+                    result += f"，{desc}"
+                return result + (" " + suffix if suffix else "")
+            result = random.choice(templates)
+            if desc:
+                result += f"，{desc}"
+            return result + (" " + suffix if suffix else "")
+            
+        elif "authenticity" in route:
+            code = params.get("code", "AF00000000A")
+            templates = [
+                f"{prefix}验证下{code}是不是正品",
+                f"防伪码{code}帮我查查真假",
+                f"{code}这个码对不对",
+                f"{prefix}看看{code}是不是真的",
+                f"帮我查查{code}这个防伪码",
+                f"{code}验一下真假",
+                f"{prefix}验证下{code}",
+                f"防伪码{code}是真的吗",
+                f"{code}帮我看看是不是正品",
+                f"{prefix}查查{code}这个码",
+                f"防伪码{code}帮我验一下",
+                f"{code}是不是官方的防伪码",
+                f"{prefix}看看{code}的真伪",
+                f"帮我验证下{code}的真假",
+                f"{code}帮我查查是不是正品",
+                f"{prefix}看看{code}这个防伪码",
+                f"防伪码{code}帮我看看",
+                f"{code}验一下看看是不是真的",
+                f"{prefix}查查{code}的真伪",
+                f"帮我看看{code}是不是正品",
+            ]
+            if has_image:
+                img_templates = [
+                    f"[IMG] 这个防伪码{prefix}验一下真假",
+                    f"[IMG] {prefix}识别图片里的防伪码",
+                    f"[IMG] 防伪码在包装上，{prefix}拍了看看",
+                    f"[IMG] 这个产品的防伪码是多少？{prefix}验一下",
+                    f"[IMG] 防伪码截图在这，{prefix}验证下",
+                    f"[IMG] {prefix}看看这个防伪标签",
+                    f"[IMG] 防伪码在图里，{prefix}查查",
+                    f"[IMG] {prefix}识别下这个防伪码",
+                ]
+                result = random.choice(img_templates)
+                if desc:
+                    result += f"，{desc}"
+                return result + (" " + suffix if suffix else "")
+            result = random.choice(templates)
+            if desc:
+                result += f"，{desc}"
+            return result + (" " + suffix if suffix else "")
+            
+        elif "search" in route:
+            category = params.get("category", "耳机")
+            templates = [
+                f"{prefix}搜一下{category}",
+                f"有没有好的{category}推荐",
+                f"{prefix}找个{category}",
+                f"{category}有什么好用的",
+                f"{prefix}推荐几款{category}",
+                f"想买{category}，{prefix}看看",
+                f"{category}哪个牌子好",
+                f"{prefix}找找{category}的爆款",
+                f"{prefix}搜搜{category}",
+                f"有没有性价比高的{category}",
+                f"{prefix}找个便宜的{category}",
+                f"{category}有什么新品",
+                f"{prefix}推荐个{category}",
+                f"想买个{category}，{prefix}看看",
+                f"{category}哪个型号好",
+                f"{prefix}找找{category}的评价",
+                f"{prefix}搜搜{category}，要好的",
+                f"有没有{category}的优惠",
+                f"{prefix}找个{category}，要正品",
+                f"{category}有什么值得买的",
+            ]
+            if has_image:
+                img_templates = [
+                    f"[IMG] {prefix}搜搜图片里的商品",
+                    f"[IMG] 这个商品{prefix}找找同款",
+                    f"[IMG] {prefix}看看图片里是什么商品",
+                    f"[IMG] 这个东西{prefix}搜一下",
+                    f"[IMG] {prefix}找找图片里的商品",
+                    f"[IMG] 这个商品截图{prefix}看看",
+                    f"[IMG] {prefix}识别下这个商品",
+                    f"[IMG] 图片里的商品{prefix}搜搜",
+                ]
+                result = random.choice(img_templates)
+                if desc:
+                    result += f"，{desc}"
+                return result + (" " + suffix if suffix else "")
+            result = random.choice(templates)
+            if desc:
+                result += f"，{desc}"
+            return result + (" " + suffix if suffix else "")
+            
+        elif "refund" in route:
+            refund_id = params.get("refund_id", "RF000000")
+            templates = [
+                f"{prefix}查下{refund_id}退款进度",
+                f"退款{refund_id}到哪了",
+                f"{refund_id}退款处理了吗",
+                f"{prefix}看看{refund_id}的状态",
+                f"退款{refund_id}什么时候到",
+                f"{refund_id}退款帮我查查",
+                f"{prefix}查查{refund_id}退款",
+                f"退款{refund_id}到账没",
+                f"{refund_id}退款帮我看看",
+                f"{prefix}看看{refund_id}退款进度",
+                f"退款{refund_id}处理了吗",
+                f"{refund_id}退款到哪了",
+                f"{prefix}查查{refund_id}的状态",
+                f"退款{refund_id}什么时候到账",
+                f"{refund_id}退款帮我查下",
+                f"{prefix}看看{refund_id}退款",
+                f"退款{refund_id}到账了吗",
+                f"{refund_id}退款进度帮我查查",
+                f"{prefix}查下{refund_id}退款",
+                f"退款{refund_id}到哪了？帮我看看",
+            ]
+            if has_image:
+                img_templates = [
+                    f"[IMG] 这是我的退款截图，{prefix}查下进度",
+                    f"[IMG] 退款单号在图里，{prefix}看看",
+                    f"[IMG] {prefix}识别下这个退款截图",
+                    f"[IMG] 退款{refund_id}的截图给你，{prefix}查",
+                    f"[IMG] 退款截图在这，{prefix}看看",
+                    f"[IMG] {prefix}看看这个退款页面",
+                    f"[IMG] 退款单截图帮我看看",
+                    f"[IMG] {prefix}识别下这个退款单号",
+                ]
+                result = random.choice(img_templates)
+                if desc:
+                    result += f"，{desc}"
+                return result + (" " + suffix if suffix else "")
+            result = random.choice(templates)
+            if desc:
+                result += f"，{desc}"
+            return result + (" " + suffix if suffix else "")
+            
+        elif "ask_user" in route:
+            templates = [
+                f"{prefix}帮我处理一下",
+                f"商品有问题",
+                f"快递没收到",
+                f"退款怎么还没到",
+                f"{prefix}查一下",
+                f"商品不对",
+                f"我要退货",
+                f"{prefix}看看",
+                f"订单有问题",
+                f"物流怎么这么慢",
+            ]
+            if has_image:
+                img_templates = [
+                    f"[IMG] {prefix}看看这个商品",
+                    f"[IMG] 这个有问题{prefix}处理",
+                    f"[IMG] {prefix}看看这个订单",
+                    f"[IMG] 这个商品不对",
+                ]
+                return random.choice(img_templates) + (" " + suffix if suffix else "")
+            return random.choice(templates) + (" " + suffix if suffix else "")
+            
+        elif "transfer_to_human" in route:
+            templates = [
+                f"我要投诉！你们的服务太差了！",
+                f"我要找你们领导！这个问题解决不了！",
+                f"你们这是什么态度！我要投诉！",
+                f"叫你们经理来！这个事情必须解决！",
+                f"你们客服太不负责任了！我要投诉！",
+                f"这个问题拖了这么久还没解决！转人工！",
+                f"你们的服务态度太差了！我要投诉！",
+                f"我打了好多次电话都没解决！转人工！",
+                f"你们再不解决我就去消协投诉！",
+                f"这个问题严重影响我的使用！转人工！",
+            ]
+            if has_image:
+                img_templates = [
+                    f"[IMG] 你们看看这个商品！太差了！转人工！",
+                    f"[IMG] 这个质量问题你们必须解决！转人工！",
+                    f"[IMG] 你们看看这个破损！我要投诉！",
+                    f"[IMG] 这个商品太差了！转人工！",
+                ]
+                return random.choice(img_templates) + (" " + suffix if suffix else "")
+            return random.choice(templates) + (" " + suffix if suffix else "")
+            
+        elif "vl_describe" in route:
+            templates = [
+                f"[IMG] {prefix}看看这是什么商品",
+                f"[IMG] 这个东西是什么牌子的？",
+                f"[IMG] {prefix}识别一下图片里的商品",
+                f"[IMG] 这个商品叫什么名字",
+                f"[IMG] {prefix}看看图片里是什么东西",
+            ]
+            return random.choice(templates) + (" " + suffix if suffix else "")
+            
+        elif "ocr" in route:
+            templates = [
+                f"[IMG] {prefix}识别一下这张图片上的文字",
+                f"[IMG] 这张截图里写了什么？",
+                f"[IMG] {prefix}读一下图片里的内容",
+                f"[IMG] 图片上的文字{prefix}提取一下",
+                f"[IMG] {prefix}看看这个图片上写的啥",
+            ]
+            return random.choice(templates) + (" " + suffix if suffix else "")
+        
+        # 回退到模板
+        return ""
 
     # ------------------------------------------------------------------
     # 模板库（50+ 句，覆盖 6 路由 + 对抗 10 类）
     # ------------------------------------------------------------------
     def _load_templates(self) -> Dict:
         return {
-            # ---- 单工具：物流查询 ----
+            # ---- 单工具：物流查询（30+ 句，50% 含 [IMG]） ----
             "logistics_single": [
+                # 无图：口语化
                 "请帮我查询订单{order_id}的物流状态",
                 "订单{order_id}到哪了？帮我查一下",
                 "{order_id}的快递走到哪了",
@@ -162,82 +506,550 @@ class TrainingDataGenerator:
                 "帮我跟踪一下{order_id}的包裹",
                 "订单{order_id}发货了吗？",
                 "{order_id}预计什么时候能到？",
+                "帮我看看{order_id}快递到哪了",
+                "{order_id}的物流能查一下吗",
+                "查下{order_id}走到哪一步了",
+                "我的包裹{order_id}现在在哪",
+                "{order_id}发出来几天了，到哪了",
+                "能帮我看看{order_id}的物流进度吗",
+                "{order_id}快递怎么还没到，帮我查查",
+                "订单{order_id}已经几天没更新了",
+                # 有图：OCR 链路
+                "[IMG] 帮我看看这个订单截图，查下物流",
+                "[IMG] 这个订单号是多少？帮我查下到哪了",
+                "[IMG] 我拍了个订单截图，帮我查物流",
+                "[IMG] 帮我识别下这个快递单号，查下到哪了",
+                "[IMG] 这个包裹到哪了？截图给你看",
+                "[IMG] 帮我看看这张图里的订单到哪了",
+                "[IMG] 你看这个快递走到哪了",
+                "[IMG] 我这有个物流截图，帮我看看啥情况",
+                "[IMG] 订单截图在这，帮我查下物流状态",
+                "[IMG] 这个快递怎么还没到，截图给你",
+                "[IMG] 帮我看下这个物流信息",
+                "[IMG] 拍了张物流截图，帮我看看",
+                "[IMG] 订单{order_id}的物流截图，帮我查下",
+                "[IMG] 快递单号在图里，帮我跟踪一下",
+                "[IMG] 这个包裹截图你帮我看看到哪了",
             ],
-            # ---- 单工具：防伪验证 ----
+            # ---- 单工具：防伪验证（30+ 句，50% 含 [IMG]） ----
             "authenticity_single": [
+                # 无图
                 "请验证这个防伪码是否正品：{code}",
                 "帮我查一下防伪码{code}是不是真的",
                 "防伪码{code}的验证结果是什么",
                 "这个产品防伪码是{code}，帮我验一下",
+                "{code}这个防伪码对不对",
+                "帮我验证下{code}是不是正品防伪码",
+                "防伪码{code}查一下真假",
+                "{code}验一下，看看是不是正品",
+                "这个防伪码{code}靠谱吗",
+                "帮我查查{code}这个码有没有问题",
+                "{code}是不是官方的防伪码",
+                "验一下防伪码{code}的真伪",
+                "产品上的防伪码是{code}，帮我看看",
+                "防伪码{code}能查到正品信息吗",
+                "{code}这个码对应的是正品吗",
+                # 有图：OCR 链路
+                "[IMG] 这个防伪码帮我验一下真假",
+                "[IMG] 帮我识别图片里的防伪码，查下真假",
+                "[IMG] 防伪码在包装上，帮我拍了看看",
+                "[IMG] 这个产品的防伪码是多少？帮我验一下",
+                "[IMG] 帮我看看这个防伪标签是不是正品",
+                "[IMG] 防伪码拍下来了，帮我查一下",
+                "[IMG] 你看这个防伪码对不对",
+                "[IMG] 我拍了防伪码的图，帮我验证",
+                "[IMG] 帮我识别下这个防伪码{code}",
+                "[IMG] 防伪码在图里，帮我验真伪",
+                "[IMG] 这个包装上的防伪码帮我查查",
+                "[IMG] 拍了防伪码照片，帮我看看是不是真的",
+                "[IMG] 防伪码截图给你，帮我验证下",
+                "[IMG] 帮我看下这个防伪码是真是假",
+                "[IMG] 产品防伪码在图片里，帮我查",
             ],
-            # ---- 单工具：商品搜索 ----
+            # ---- 单工具：商品搜索（40+ 句，部分含 [IMG]） ----
             "search_single": [
+                # 无图
                 "请帮我搜索{category}相关的商品",
                 "我想找一些{category}类的产品",
                 "帮我看看有没有好的{category}商品推荐",
                 "{category}类目下有什么热销商品？",
+                "帮我搜一下{category}",
+                "有没有性价比高的{category}推荐",
+                "我想买个{category}，帮我看看",
+                "{category}有什么好用的推荐吗",
+                "帮我找个便宜点的{category}",
+                "最近{category}有什么新品吗",
+                "想买{category}，帮我搜搜看",
+                "{category}哪个牌子好？帮我搜一下",
+                "帮我找找{category}的爆款",
+                "有没有适合送礼的{category}推荐",
+                "{category}类目下销量最好的是什么",
+                "帮我看看{category}的评价怎么样",
+                "推荐几款{category}给我看看",
+                "帮我搜搜{category}，要质量好的",
+                "{category}有没有新品上市",
+                "帮我找找{category}，预算500以内",
+                "想看看{category}的商品，帮我搜一下",
+                "{category}有什么值得买的",
+                "帮我推荐几个{category}品牌",
+                "{category}类目下价格最便宜的是什么",
+                "有没有{category}的优惠活动",
+                "帮我搜一下{category}，要正品",
+                "{category}哪个型号最好",
+                "帮我找找{category}的用户评价",
+                "想买个好点的{category}，帮我看看",
+                "{category}有没有限时折扣",
+                "帮我搜搜{category}，要好评多的",
+                "{category}有没有新品推荐",
+                "帮我找找{category}，要销量高的",
+                "想买{category}，帮我看看有什么好的",
+                "{category}类目下有什么新品",
+                "帮我推荐几款{category}，要便宜的",
+                "{category}有没有活动价",
+                "帮我搜搜{category}，要品牌正品",
+                # 有图：图片搜索
+                "[IMG] 帮我搜搜图片里的商品",
+                "[IMG] 这个商品帮我找找同款",
+                "[IMG] 帮我看看图片里是什么商品",
+                "[IMG] 这个东西帮我搜一下",
+                "[IMG] 帮我找找图片里的商品",
             ],
-            # ---- 单工具：退款查询 ----
+            # ---- 单工具：退款查询（30+ 句，50% 含 [IMG]） ----
             "refund_single": [
+                # 无图
                 "请查询退款单{refund_id}的处理进度",
                 "退款{refund_id}到哪一步了？",
                 "帮我看看退款{refund_id}的状态",
+                "{refund_id}退款处理得怎么样了",
+                "退款单{refund_id}审核通过了吗",
+                "帮我查下{refund_id}退到哪了",
+                "退款{refund_id}什么时候能到账",
+                "{refund_id}退款进度查一下",
+                "我的退款{refund_id}处理到哪一步了",
+                "退款{refund_id}还没到账，帮我查查",
+                "{refund_id}退款状态是什么",
+                "帮我看看{refund_id}退款审核结果",
+                "退款{refund_id}处理了几天了",
+                "{refund_id}退款到银行卡了吗",
+                "退款{refund_id}的进度能帮我查一下吗",
+                # 有图：OCR 链路
+                "[IMG] 这是我的退款截图，帮我查下进度",
+                "[IMG] 退款单号在图里，帮我看看",
+                "[IMG] 帮我识别下这个退款截图里的单号",
+                "[IMG] 退款{refund_id}的截图给你，帮我查",
+                "[IMG] 我拍了退款页面，帮我看看进度",
+                "[IMG] 帮我看看这个退款截图",
+                "[IMG] 退款单截图在这，帮我查下状态",
+                "[IMG] 退款页面截图，帮我看看到哪了",
+                "[IMG] 帮我识别退款截图里的信息",
+                "[IMG] 退款进度截图给你看看",
+                "[IMG] 这个退款{refund_id}截图帮我查查",
+                "[IMG] 退款状态截图在这",
+                "[IMG] 帮我看看这个退款页面",
+                "[IMG] 退款单{refund_id}的页面截图",
+                "[IMG] 退款截图发你了，帮我查查",
             ],
             # ---- 单工具：图片描述 ----
             "vl_describe_single": [
-                "请分析这张图片中的商品",
-                "帮我看看这张图片里是什么",
-                "请描述一下这张图片的内容",
+                "[IMG] 帮我看看这是什么商品",
+                "[IMG] 这个东西是什么牌子的？",
+                "[IMG] 帮我识别一下图片里的商品",
+                "[IMG] 这个商品叫什么名字",
+                "[IMG] 帮我看看图片里是什么东西",
+                "[IMG] 这个商品是什么类目的",
+                "[IMG] 帮我看看这个商品的外观",
+                "[IMG] 图片里的商品帮我描述一下",
+                "[IMG] 这个商品看起来怎么样",
+                "[IMG] 帮我识别下这个商品的品牌",
             ],
             # ---- 多工具：退款流程 ----
             "refund_flow": [
-                "我买的商品有质量问题，订单号是{order_id}，请帮我申请退款",
-                "订单{order_id}收到的商品有瑕疵，我要退款",
-                "{order_id}的商品坏了，帮我提交退款申请",
-                "我要退掉{order_id}，商品和描述不符",
+                "[IMG] 这个商品有质量问题，帮我退款",
+                "[IMG] 收到的东西有瑕疵，帮我退了",
+                "[IMG] 你看这个商品明显坏了，帮我申请退款",
+                "[IMG] 这个商品跟描述不符，帮我退",
+                "[IMG] 收到的货有破损，帮我退款吧",
+                "订单{order_id}，商品有问题想退款",
+                "{order_id} 收到的商品坏了，帮我申请退款",
+                "帮我退掉{order_id}，质量有问题",
+                "{order_id}的商品有瑕疵，帮我退款",
+                "订单{order_id}收到的东西不对，帮我退",
+                "我想退掉{order_id}，商品有问题",
+                "{order_id}退款，收到的东西有毛病",
+                "帮我申请{order_id}的退款，质量不行",
+                "订单{order_id}的商品破损了，帮我退",
+                "{order_id}收到的东西跟图片不一样",
             ],
-            # ---- 多工具：同款比价 ----
+            # ---- 多工具：同款比价（30+ 种） ----
             "price_compare": [
-                "请帮我找到图片中的同款商品并比较价格",
-                "这张图片里的商品在其他平台多少钱？",
-                "帮我搜一下图片里的商品，对比一下各平台价格",
+                "[IMG] 帮我搜一下图片里的商品，对比一下价格",
+                "[IMG] 这个东西其他平台卖多少钱？",
+                "[IMG] 帮我找找同款，看哪里便宜",
+                "[IMG] 帮我搜一下这个商品的最低价",
+                "[IMG] 这个商品在哪个平台最便宜",
+                "[IMG] 帮我比比这个商品的价格",
+                "[IMG] 同款商品帮我搜搜看",
+                "帮我找个同款商品比比价",
+                "帮我搜一下这个商品的最低价",
+                "同款商品哪个平台便宜",
+                "帮我比比这个商品的价格",
+                "找个同款，看哪里划算",
+                "帮我搜搜同款商品的价格",
+                "这个商品帮我比比价",
+                "帮我找找这个商品的优惠价",
+                "[IMG] 帮我搜搜这个商品的价格",
+                "[IMG] 这个商品帮我比比价",
+                "[IMG] 帮我找找同款商品",
+                "[IMG] 同款商品帮我比比价格",
+                "[IMG] 帮我搜一下这个商品",
+                "帮我找个便宜的同款",
+                "帮我比比这个商品",
+                "同款商品帮我搜搜",
+                "帮我搜搜这个商品的价格",
+                "这个商品帮我找找同款",
+                "帮我比比同款商品的价格",
+                "找个同款商品比比价",
+                "帮我搜搜同款的价格",
+                "这个商品帮我比比",
+                "帮我找找这个商品的优惠",
+                "[IMG] 帮我看看这个商品的价格",
+                "[IMG] 这个商品帮我搜搜同款",
             ],
             # ---- 多工具：签收后验货 ----
             "post_delivery": [
-                "订单{order_id}刚签收，请帮我检查商品是否有问题",
-                "{order_id}已经收到了，帮我验证一下是不是正品",
-                "我收到{order_id}了，帮我看看有没有质量瑕疵",
+                "[IMG] 刚收到的货，帮我看看有没有问题",
+                "[IMG] 这个是正品吗？帮我验一下",
+                "[IMG] 收到的货你帮我看看有没有瑕疵",
+                "[IMG] 帮我看看这个商品质量怎么样",
+                "[IMG] 这个商品帮我验一下真假",
+                "[IMG] 收到的东西帮我看看对不对",
+                "[IMG] 帮我检查下这个商品有没有问题",
+                "订单{order_id}到了，帮我看看有没有问题",
+                "{order_id} 收到了，帮我验一下是不是正品",
+                "{order_id}到了，帮我检查下商品",
+                "订单{order_id}签收了，帮我验验货",
+                "{order_id}收到的货帮我看看",
+                "帮我看看{order_id}收到的商品有没有问题",
+                "订单{order_id}到了，帮我验一下",
+                "{order_id}签收了，帮我看看是不是正品",
             ],
             # ---- 多轮：物流→验货→退款 ----
             "multi_turn_lrv": [
-                [
-                    "请帮我查询订单{order_id}的物流状态",
-                    "如果已签收，请帮我检查商品是否有瑕疵",
-                    "如果有瑕疵，请帮我申请退款",
-                ],
+                ["[IMG] 帮我查一下这个订单的物流到哪了", "到了的话帮我看看有没有问题", "有问题的话帮我退了"],
+                ["{order_id} 到哪了？帮我查下物流", "到了帮我看看有没有问题", "有问题就帮我申请退款"],
+                ["[IMG] 这个快递到哪了？截图给你", "到了帮我验一下货", "有瑕疵就帮我退"],
+                ["帮我查下{order_id}的物流", "到了帮我看看商品质量", "质量不行就帮我退掉"],
+                ["[IMG] 订单截图在这，帮我查物流", "到了帮我检查一下", "有问题帮我申请退款"],
+                ["{order_id}快递到哪了", "帮我看看收到的东西有没有问题", "有问题就退款"],
+                ["[IMG] 帮我跟踪下这个包裹", "到了帮我验一下", "有瑕疵帮我退了"],
+                ["查下{order_id}到哪了", "到了帮我看看是不是正品", "不是正品帮我退"],
             ],
-            # ---- 多轮：搜索→比价→建议 ----
+            # ---- 多轮：搜索→比价→建议（20+ 种组合） ----
             "multi_turn_spa": [
-                [
-                    "请帮我搜索{category}类的商品",
-                    "帮我比较一下前几个的价格",
-                    "你觉得哪个性价比最高？",
-                ],
+                ["帮我找个{category}", "前面几个帮我比比价", "哪个好？帮我选一个"],
+                ["[IMG] 这是什么商品？帮我搜搜同款", "帮我比比价格", "哪个平台最便宜"],
+                ["帮我推荐个{category}", "帮我比比这几个的价格", "帮我选个性价比最高的"],
+                ["搜一下{category}", "帮我对比下价格", "你觉得哪个值得买"],
+                ["[IMG] 帮我找找这个商品", "比比各个平台的价格", "帮我选个最好的"],
+                ["帮我找个好的{category}", "前面几个帮我比比", "哪个值得买"],
+                ["[IMG] 这个商品帮我搜搜", "帮我比比价格", "帮我选个最便宜的"],
+                ["推荐个{category}", "帮我对比下这几个", "哪个性价比高"],
+                ["搜搜{category}", "帮我比比价格", "你觉得哪个好"],
+                ["[IMG] 帮我看看这个商品", "搜一下同款比比价", "帮我选个最好的"],
+                ["帮我找个{category}，要好的", "前面几个帮我比比", "哪个值得买"],
+                ["[IMG] 这是什么？帮我搜搜", "帮我比比价格", "帮我选个最划算的"],
+                ["推荐个好的{category}", "帮我对比下价格", "哪个品牌好"],
+                ["搜一下好的{category}", "帮我比比这几个", "你觉得哪个值得买"],
+                ["[IMG] 帮我找找同款", "比比各个平台的价格", "帮我选个最好的"],
+                ["帮我找个便宜的{category}", "前面几个帮我比比", "哪个性价比高"],
+                ["[IMG] 这个商品帮我找找", "帮我比比价格", "帮我选个最便宜的"],
+                ["推荐个便宜的{category}", "帮我对比下这几个", "哪个值得买"],
+                ["搜搜便宜的{category}", "帮我比比价格", "你觉得哪个好"],
+                ["[IMG] 帮我看看这个", "搜一下比比价", "帮我选个最好的"],
             ],
-            # ---- 多轮：OCR→查物流 ----
+            # ---- 多轮：OCR→查物流（100+ 种组合） ----
             "multi_turn_ocr_logistics": [
-                [
-                    "请帮我识别这张订单截图上的信息",
-                    "根据识别出的订单号，帮我查一下物流状态",
-                ],
+                ["[IMG] 帮我识别一下这个订单截图", "识别出来了吗？帮我查下物流"],
+                ["[IMG] 这个快递单号帮我看看", "帮我查下这个快递到哪了"],
+                ["[IMG] 订单号在图里，帮我读出来", "读出来帮我查下物流状态"],
+                ["[IMG] 帮我看看这个物流截图", "帮我跟踪一下这个包裹"],
+                ["[IMG] 这个包裹到哪了？截图给你", "帮我查下物流进度"],
+                ["[IMG] 帮我识别下这个快递单号", "查下到哪了"],
+                ["[IMG] 订单截图在这，帮我看看", "帮我查下物流"],
+                ["[IMG] 帮我看看这个订单号", "帮我查下物流状态"],
+                ["[IMG] 这个快递截图帮我看看", "帮我跟踪一下"],
+                ["[IMG] 帮我识别下这个订单", "帮我查下到哪了"],
+                ["[IMG] 订单号在图片里", "帮我查下物流"],
+                ["[IMG] 帮我看看这个快递单号", "帮我查下物流进度"],
+                ["[IMG] 这个包裹截图帮我看看", "帮我跟踪一下"],
+                ["[IMG] 帮我识别下这个物流信息", "帮我查下到哪了"],
+                ["[IMG] 订单截图发你了", "帮我查下物流状态"],
+                ["[IMG] 帮我看看这个快递截图", "帮我跟踪一下包裹"],
+                ["[IMG] 这个订单号帮我看看", "帮我查下物流进度"],
+                ["[IMG] 帮我识别下这个包裹", "帮我查下到哪了"],
+                ["[IMG] 订单截图在这", "帮我查下物流"],
+                ["[IMG] 帮我看看这个物流单号", "帮我跟踪一下"],
+                ["[IMG] 这个快递帮我看看", "帮我查下物流状态"],
+                ["[IMG] 帮我识别下这个订单截图", "帮我查下进度"],
+                ["[IMG] 订单号在图里", "帮我查下到哪了"],
+                ["[IMG] 帮我看看这个包裹截图", "帮我跟踪一下"],
+                ["[IMG] 这个物流截图帮我看看", "帮我查下物流"],
+                ["[IMG] 帮我识别下这个快递", "帮我查下物流进度"],
+                ["[IMG] 订单截图发你了", "帮我查下到哪了"],
+                ["[IMG] 帮我看看这个订单", "帮我查下物流状态"],
+                ["[IMG] 这个包裹帮我看看", "帮我跟踪一下"],
+                ["[IMG] 帮我识别下这个物流截图", "帮我查下物流"],
+                # 更多变体
+                ["[IMG] 这个快递单号是多少？帮我查物流", "查到了吗？帮我看看到哪了"],
+                ["[IMG] 帮我看看这个订单到哪了", "到了吗？帮我查下物流状态"],
+                ["[IMG] 这个包裹截图帮我看看", "帮我查下物流进度"],
+                ["[IMG] 帮我识别下这个快递单号", "帮我跟踪一下这个包裹"],
+                ["[IMG] 订单截图在这，帮我查查", "帮我看看物流到哪了"],
+                ["[IMG] 帮我看看这个物流信息", "帮我查下到哪了"],
+                ["[IMG] 这个订单号帮我查查", "帮我看看物流状态"],
+                ["[IMG] 帮我识别下这个包裹截图", "帮我跟踪一下"],
+                ["[IMG] 订单号在图片里，帮我看看", "帮我查下物流进度"],
+                ["[IMG] 帮我看看这个快递到哪了", "帮我查下物流状态"],
+                ["[IMG] 这个物流截图帮我查查", "帮我跟踪一下包裹"],
+                ["[IMG] 帮我识别下这个订单号", "帮我查下到哪了"],
+                ["[IMG] 订单截图发你了，帮我看看", "帮我查下物流进度"],
+                ["[IMG] 帮我看看这个包裹到哪了", "帮我跟踪一下"],
+                ["[IMG] 这个快递帮我查查", "帮我查下物流状态"],
+                ["[IMG] 帮我识别下这个物流单号", "帮我查下到哪了"],
+                ["[IMG] 订单截图在这，帮我查下", "帮我看看物流进度"],
+                ["[IMG] 帮我看看这个订单截图", "帮我跟踪一下包裹"],
+                ["[IMG] 这个包裹帮我查下", "帮我查下物流状态"],
+                ["[IMG] 帮我识别下这个快递截图", "帮我查下到哪了"],
+                # 更多口语化变体
+                ["[IMG] 这个快递到哪了？截图给你", "帮我查下物流进度"],
+                ["[IMG] 帮我看看这个订单，截图在这", "帮我查下物流状态"],
+                ["[IMG] 这个包裹截图发你了", "帮我跟踪一下"],
+                ["[IMG] 帮我识别下这个快递单号", "帮我查下物流进度"],
+                ["[IMG] 订单截图在这，帮我看看", "帮我查下到哪了"],
+                ["[IMG] 帮我看看这个物流截图", "帮我查下物流状态"],
+                ["[IMG] 这个订单号帮我看看截图", "帮我跟踪一下包裹"],
+                ["[IMG] 帮我识别下这个包裹", "帮我查下物流进度"],
+                ["[IMG] 订单号在图里，帮我查查", "帮我查下到哪了"],
+                ["[IMG] 帮我看看这个快递截图", "帮我查下物流状态"],
+                ["[IMG] 这个物流截图帮我看看", "帮我跟踪一下"],
+                ["[IMG] 帮我识别下这个订单", "帮我查下物流进度"],
+                ["[IMG] 订单截图发你了，帮我查查", "帮我查下到哪了"],
+                ["[IMG] 帮我看看这个包裹截图", "帮我查下物流状态"],
+                ["[IMG] 这个快递帮我看看截图", "帮我跟踪一下包裹"],
+                ["[IMG] 帮我识别下这个物流信息", "帮我查下物流进度"],
+                ["[IMG] 订单截图在这，帮我查下", "帮我查下到哪了"],
+                ["[IMG] 帮我看看这个订单号截图", "帮我查下物流状态"],
+                ["[IMG] 这个包裹帮我查查截图", "帮我跟踪一下"],
+                ["[IMG] 帮我识别下这个快递单号", "帮我查下物流进度"],
+                # 更多简短变体
+                ["[IMG] 订单截图，帮我查物流", "帮我看看到哪了"],
+                ["[IMG] 快递单号在图里，帮我查", "帮我查下物流状态"],
+                ["[IMG] 帮我看看这个订单", "帮我查下物流"],
+                ["[IMG] 这个包裹帮我查下", "帮我跟踪一下"],
+                ["[IMG] 订单号帮我看看", "帮我查下物流进度"],
+                ["[IMG] 帮我识别下这个快递", "帮我查下到哪了"],
+                ["[IMG] 订单截图发你了", "帮我查下物流状态"],
+                ["[IMG] 帮我看看这个包裹", "帮我跟踪一下"],
+                ["[IMG] 这个快递帮我查查", "帮我查下物流进度"],
+                ["[IMG] 帮我识别下这个订单截图", "帮我查下到哪了"],
+                # 更多变体
+                ["[IMG] 这个订单截图帮我看看", "帮我查下物流状态"],
+                ["[IMG] 帮我看看这个快递单号截图", "帮我跟踪一下包裹"],
+                ["[IMG] 这个包裹截图帮我查查", "帮我查下物流进度"],
+                ["[IMG] 帮我识别下这个物流截图", "帮我查下到哪了"],
+                ["[IMG] 订单截图在这，帮我看看", "帮我查下物流状态"],
+                ["[IMG] 帮我看看这个订单号", "帮我跟踪一下"],
+                ["[IMG] 这个快递截图帮我查查", "帮我查下物流进度"],
+                ["[IMG] 帮我识别下这个包裹截图", "帮我查下到哪了"],
+                ["[IMG] 订单号在图里，帮我看看", "帮我查下物流状态"],
+                ["[IMG] 帮我看看这个物流单号截图", "帮我跟踪一下包裹"],
+                ["[IMG] 这个包裹帮我看看截图", "帮我查下物流进度"],
+                ["[IMG] 帮我识别下这个快递单号", "帮我查下到哪了"],
+                ["[IMG] 订单截图发你了，帮我看看", "帮我查下物流状态"],
+                ["[IMG] 帮我看看这个订单截图", "帮我跟踪一下"],
+                ["[IMG] 这个快递帮我查查截图", "帮我查下物流进度"],
+                ["[IMG] 帮我识别下这个物流信息", "帮我查下到哪了"],
             ],
             # ---- 多轮：图片→搜索→比价 ----
             "multi_turn_img_search": [
-                [
-                    "请分析这张图片中的商品",
-                    "请帮我找到同款商品并比较价格",
-                    "如果价格合适，请帮我推荐购买渠道",
-                ],
+                ["[IMG] 这是什么商品？帮我看看", "帮我搜一下同款", "帮我比比价，看哪里便宜"],
+                ["[IMG] 帮我识别下图片里的商品", "搜一下同款商品", "哪个平台价格最低"],
+                ["[IMG] 这个商品叫什么", "帮我找找同款", "比比价格帮我选一个"],
+            ],
+            # ---- 单工具：OCR 识别 ----
+            "ocr_single": [
+                "[IMG] 帮我识别一下这张图片上的文字",
+                "[IMG] 这张截图里写了什么？",
+                "[IMG] 帮我读一下图片里的内容",
+                "[IMG] 图片上的文字帮我提取一下",
+                "[IMG] 帮我看看这个图片上写的啥",
+                "[IMG] 这个截图里的文字帮我识别下",
+                "[IMG] 帮我读一下这个图片",
+                "[IMG] 图片里的内容帮我看看",
+                "[IMG] 这个图片上有什么字",
+                "[IMG] 帮我提取下图片里的文字",
+            ],
+            # ---- 单工具：询问用户（含模糊指代，部分含 [IMG]） ----
+            "ask_user_single": [
+                # 无图
+                "我要退款",
+                "帮我查一下物流",
+                "这个商品有问题",
+                "帮我看看那个订单",
+                "上次买的那个东西怎么样了",
+                "我要退那个",
+                "帮我查查之前的订单",
+                "那个快递到哪了",
+                "上次的退款处理了吗",
+                "之前买的东西有问题",
+                "帮我处理一下",
+                "商品有问题",
+                "快递没收到",
+                "退款怎么还没到",
+                "帮我查一下",
+                "商品不对",
+                "我要退货",
+                "帮我看看",
+                "订单有问题",
+                "物流怎么这么慢",
+                # 有图
+                "[IMG] 帮我看看这个商品",
+                "[IMG] 这个有问题帮我处理",
+                "[IMG] 帮我看看这个订单",
+                "[IMG] 这个商品不对",
+                "[IMG] 帮我处理一下这个",
+            ],
+            # ---- 单工具：转人工（部分含 [IMG]） ----
+            "transfer_to_human_single": [
+                # 无图
+                "我要投诉！你们的服务太差了！",
+                "我要找你们领导！这个问题解决不了！",
+                "你们这是什么态度！我要投诉！",
+                "叫你们经理来！这个事情必须解决！",
+                "你们客服太不负责任了！我要投诉！",
+                "这个问题拖了这么久还没解决！转人工！",
+                "你们的服务态度太差了！我要投诉！",
+                "我打了好多次电话都没解决！转人工！",
+                "你们再不解决我就去消协投诉！",
+                "这个问题严重影响我的使用！转人工！",
+                "你们太不负责任了！转人工！",
+                "这个问题必须给我解决！转人工！",
+                "你们的服务太差了！转人工！",
+                "我要投诉你们！转人工！",
+                "这个问题拖了好久了！转人工！",
+                # 有图
+                "[IMG] 你们看看这个商品！太差了！转人工！",
+                "[IMG] 这个质量问题你们必须解决！转人工！",
+                "[IMG] 你们看看这个破损！我要投诉！",
+                "[IMG] 这个商品太差了！转人工！",
+                "[IMG] 你们看看这个问题！转人工！",
+            ],
+            # ---- 多轮：情绪升级 ----
+            "multi_turn_emotion": [
+                ["订单{order_id}好几天了还没到，帮我查查", "怎么这么慢！你们的服务太差了", "我要投诉你们！赶紧给我处理"],
+                ["退款{refund_id}怎么还没到账", "都等了一个星期了！你们效率太低了", "再不处理我就去投诉"],
+                ["[IMG] 收到的商品有问题，帮我退了", "怎么这么麻烦！你们就不能快点处理吗", "你们这是什么态度！我要投诉"],
+                ["{order_id}的物流帮我查下", "怎么还在路上！太慢了", "你们的服务太差了，我要投诉"],
+                ["帮我查下退款{refund_id}", "还没处理完？效率太低了", "我要找你们领导投诉"],
+                ["[IMG] 这个商品有瑕疵，帮我退", "你们处理速度太慢了", "再不解决我就去消协投诉"],
+                ["订单{order_id}帮我查下物流", "怎么还没到！等了好久了", "你们的服务态度太差了，投诉"],
+                ["退款{refund_id}到哪了", "都好几天了还没退", "你们太不负责任了，我要投诉"],
+            ],
+            # ---- 多轮：模糊指代→追问（100+ 种组合） ----
+            "multi_turn_vague": [
+                ["帮我查下那个订单", "那个快递到哪了", "之前买的那个东西退款了吗"],
+                ["上次买的那个怎么样了", "就是那个订单帮我查查", "那个物流到哪了"],
+                ["帮我看看之前的订单", "就是那个帮我查下", "那个退款处理了吗"],
+                ["那个商品帮我退了", "就是之前买的那个", "帮我查下那个订单的状态"],
+                ["帮我查查那个快递", "上次那个订单到哪了", "那个帮我看看"],
+                ["帮我看看那个", "就是之前那个订单", "那个快递到哪了"],
+                ["那个订单帮我查查", "上次那个怎么样了", "那个退款处理了吗"],
+                ["帮我查下之前的订单", "那个快递到哪了", "之前买的那个退款了吗"],
+                ["上次那个帮我看看", "就是那个订单", "那个物流到哪了"],
+                ["帮我看看那个商品", "之前那个订单帮我查查", "那个退款了吗"],
+                ["那个快递帮我查下", "上次那个订单到哪了", "那个帮我看看"],
+                ["帮我查查那个订单", "就是之前那个", "那个物流到哪了"],
+                ["那个商品怎么样了", "上次那个帮我查查", "那个退款处理了吗"],
+                ["帮我看看之前的", "那个订单到哪了", "之前买的那个退款了吗"],
+                ["那个快递到哪了", "帮我查下那个订单", "那个退款了吗"],
+                ["帮我查下那个", "上次那个订单", "那个物流到哪了"],
+                ["那个商品帮我看看", "就是之前那个订单", "那个退款处理了吗"],
+                ["帮我看看那个快递", "上次那个帮我查查", "那个到哪了"],
+                ["那个订单怎么样了", "帮我查下之前的", "那个退款了吗"],
+                ["帮我查查那个", "就是那个商品", "那个物流到哪了"],
+                ["那个快递帮我看看", "上次那个订单到哪了", "那个退款处理了吗"],
+                ["帮我看看之前那个", "那个订单帮我查查", "那个到哪了"],
+                ["那个商品到哪了", "帮我查下那个快递", "那个退款了吗"],
+                ["帮我查下之前的那个", "上次那个怎么样了", "那个物流到哪了"],
+                ["那个订单帮我看看", "就是那个快递", "那个退款处理了吗"],
+                ["帮我看看那个", "上次那个商品", "那个到哪了"],
+                ["那个快递怎么样了", "帮我查下那个订单", "那个退款了吗"],
+                ["帮我查查之前那个", "就是那个订单", "那个物流到哪了"],
+                ["那个商品帮我查查", "上次那个快递到哪了", "那个退款处理了吗"],
+                ["帮我看看之前的订单", "那个到哪了", "那个退款了吗"],
+                # 更多变体
+                ["帮我查下那个", "就是之前那个订单", "那个物流到哪了"],
+                ["上次那个怎么样了", "帮我看看那个订单", "那个退款了吗"],
+                ["那个商品帮我看看", "就是那个快递", "那个退款处理了吗"],
+                ["帮我查查之前的", "上次那个订单到哪了", "那个到哪了"],
+                ["那个快递帮我查查", "就是之前那个商品", "那个退款了吗"],
+                ["帮我看看那个订单", "上次那个怎么样了", "那个物流到哪了"],
+                ["那个商品到哪了", "帮我查下那个快递", "那个退款处理了吗"],
+                ["帮我查下之前的那个", "就是那个订单", "那个到哪了"],
+                ["那个订单帮我看看", "上次那个快递到哪了", "那个退款了吗"],
+                ["帮我看看那个", "就是之前那个商品", "那个物流到哪了"],
+                ["那个快递怎么样了", "帮我查下那个订单", "那个退款处理了吗"],
+                ["帮我查查之前那个", "上次那个帮我看看", "那个到哪了"],
+                ["那个商品帮我查查", "就是那个订单", "那个退款了吗"],
+                ["帮我看看之前的订单", "上次那个快递到哪了", "那个物流到哪了"],
+                ["那个快递到哪了", "帮我查下那个商品", "那个退款处理了吗"],
+                ["帮我查下那个订单", "就是之前那个", "那个到哪了"],
+                ["那个商品帮我看看", "上次那个订单到哪了", "那个退款了吗"],
+                ["帮我看看那个快递", "就是那个商品", "那个物流到哪了"],
+                ["那个订单怎么样了", "帮我查下之前的", "那个退款处理了吗"],
+                ["帮我查查那个", "上次那个帮我查查", "那个到哪了"],
+                # 更多口语化变体
+                ["帮我看看那个订单", "那个快递到哪了", "之前那个退款了吗"],
+                ["上次买的那个帮我查查", "就是那个订单", "那个物流到哪了"],
+                ["帮我查下那个商品", "上次那个怎么样了", "那个退款处理了吗"],
+                ["那个快递帮我看看", "就是之前那个订单", "那个到哪了"],
+                ["帮我看看之前的", "那个订单帮我查查", "那个退款了吗"],
+                ["那个商品怎么样了", "帮我查下那个快递", "那个物流到哪了"],
+                ["帮我查查那个订单", "上次那个快递到哪了", "那个退款处理了吗"],
+                ["那个快递到哪了", "就是那个商品", "那个到哪了"],
+                ["帮我看看那个", "帮我查下之前的订单", "那个退款了吗"],
+                ["上次那个怎么样了", "那个订单到哪了", "那个物流到哪了"],
+                ["那个商品帮我查查", "就是那个快递", "那个退款处理了吗"],
+                ["帮我查下那个", "上次那个帮我看看", "那个到哪了"],
+                ["那个订单帮我看看", "就是之前那个商品", "那个退款了吗"],
+                ["帮我看看那个快递", "上次那个订单到哪了", "那个物流到哪了"],
+                ["那个商品到哪了", "帮我查下那个订单", "那个退款处理了吗"],
+                ["帮我查查之前的那个", "就是那个快递", "那个到哪了"],
+                ["那个快递怎么样了", "帮我看看那个商品", "那个退款了吗"],
+                ["帮我看看之前那个", "上次那个怎么样了", "那个物流到哪了"],
+                ["那个订单怎么样了", "帮我查下那个快递", "那个退款处理了吗"],
+                ["帮我查查那个", "就是那个订单", "那个到哪了"],
+                # 更多简短变体
+                ["帮我查下那个", "那个到哪了", "那个退款了吗"],
+                ["上次那个帮我看看", "那个物流到哪了", "那个退款处理了吗"],
+                ["那个商品帮我查查", "那个快递到哪了", "那个到哪了"],
+                ["帮我看看那个订单", "那个怎么样了", "那个退款了吗"],
+                ["那个快递帮我看看", "帮我查下那个", "那个物流到哪了"],
+                ["帮我查查之前的", "那个订单到哪了", "那个退款处理了吗"],
+                ["那个商品怎么样了", "帮我看看那个", "那个到哪了"],
+                ["帮我看看那个快递", "那个帮我查查", "那个退款了吗"],
+                ["那个订单帮我查查", "上次那个到哪了", "那个物流到哪了"],
+                ["帮我查下那个商品", "就是那个快递", "那个退款处理了吗"],
+                ["那个快递到哪了", "帮我看看那个订单", "那个到哪了"],
+                ["帮我看看之前的", "那个商品帮我查查", "那个退款了吗"],
+                ["上次那个怎么样了", "帮我查下那个", "那个物流到哪了"],
+                ["那个商品帮我看看", "就是那个订单", "那个退款处理了吗"],
+                ["帮我查查那个订单", "那个快递帮我看看", "那个到哪了"],
+                ["那个快递帮我查查", "帮我看看那个商品", "那个退款了吗"],
+                ["帮我看看那个", "上次那个订单到哪了", "那个物流到哪了"],
+                ["那个订单怎么样了", "帮我查下那个快递", "那个退款处理了吗"],
+                ["帮我查下之前的那个", "就是那个商品", "那个到哪了"],
+                ["那个商品到哪了", "帮我看看那个订单", "那个退款了吗"],
             ],
         }
 
@@ -314,7 +1126,7 @@ class TrainingDataGenerator:
                 "查一下价格",
             ],
             "correct_behavior": "ask_user",
-            "correct_response": "请问您需要退款的是哪个订单？请提供订单号。/ 请问您需要验证的是哪个防伪码？/ 请问您想查询哪个商品的价格？",
+            "correct_response": "请问您需要处理什么问题？请提供具体的订单号或防伪码，我来帮您查询。",
         },
         {
             "name": "多轮编造/幻觉",
@@ -344,7 +1156,7 @@ class TrainingDataGenerator:
                 "帮我验证防伪码{code}，这个产品已经停产了",
             ],
             "correct_behavior": "ask_user",
-            "correct_response": "这个订单/商品可能已超出售后服务时限。请提供更多信息，我帮您确认是否还在服务范围内。",
+            "correct_response": "这个订单可能已超出售后服务时限。请提供更多信息，我帮您确认是否还在服务范围内。",
         },
     ]
 
@@ -416,12 +1228,15 @@ class TrainingDataGenerator:
         """
         messages: List[Dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-        # user 消息
+        # user 消息：移除 [IMG] 标记，有图时添加图片
         user_content: List[Dict] = []
+        clean_query = query.replace("[IMG]", "").strip()
         if image_path:
             user_content.append({"type": "image", "image": image_path})
-        user_content.append({"type": "text", "text": query})
-        messages.append({"role": "user", "content": user_content if image_path else query})
+            user_content.append({"type": "text", "text": clean_query})
+            messages.append({"role": "user", "content": user_content})
+        else:
+            messages.append({"role": "user", "content": clean_query})
 
         # 逐工具执行
         for step in gold_chain:
@@ -472,10 +1287,14 @@ class TrainingDataGenerator:
     # 单工具题 → 轨迹
     # ------------------------------------------------------------------
     def generate_single_tool_questions(self, n: int = 3000) -> List[Dict]:
-        """生成单工具题目并构建完整轨迹"""
+        """生成单工具题目并构建完整轨迹
+        
+        对于含 [IMG] 的物流/退款/防伪路由，使用 OCR-first 链路：
+        ocr → 主工具（如 query_logistics），满足 OCR 覆盖率要求。
+        """
         trajectories = []
         attempts = 0
-        max_attempts = n * 3  # 允许重试
+        max_attempts = n * 3
 
         while len(trajectories) < n and attempts < max_attempts:
             attempts += 1
@@ -483,9 +1302,18 @@ class TrainingDataGenerator:
             route = random.choice([
                 "logistics_single", "authenticity_single",
                 "search_single", "refund_single", "vl_describe_single",
+                "ocr_single", "ask_user_single", "transfer_to_human_single",
             ])
             template = random.choice(self.templates[route])
             image_path = None
+
+            # 如果模板包含 [IMG] 标记，采样一张图片
+            # 对于 search_single，强制使用图片（提高多模态覆盖）
+            if "[IMG]" in template and self._cached_images:
+                image_path = str(random.choice(self._cached_images))
+            elif route == "search_single" and self._cached_images and random.random() < 0.7:
+                # 70% 概率强制使用图片
+                image_path = str(random.choice(self._cached_images))
 
             # 填充参数 + 构建金标工具链
             params = {}
@@ -494,34 +1322,111 @@ class TrainingDataGenerator:
             if "logistics" in route:
                 order_id = self._sample_order_id()
                 params["order_id"] = order_id
-                gold_chain = [{"tool": "query_logistics", "args": {"order_id": order_id}}]
+                if image_path:
+                    # 注册图片到 executor session（类型为订单截图）
+                    img_ref = self._prepare_executor_session(order_id=order_id, image_path=image_path)
+                    # 修改图片类型为订单截图，使 OCR 能识别
+                    self.executor.images[img_ref]["type"] = "order_screenshot"
+                    self.executor.images[img_ref]["order_id"] = order_id
+                    self.executor.images[img_ref]["price"] = round(random.uniform(50, 500), 2)
+                    self.executor.images[img_ref]["status_cn"] = random.choice(["已发货", "运输中", "派送中"])
+                    # OCR-first 链路：先 OCR 识别订单号，再查物流
+                    gold_chain = [
+                        {"tool": "ocr", "args": {"image_ref": img_ref, "focus": "order_id"}},
+                        {"tool": "query_logistics", "args": {"order_id": order_id}},
+                    ]
+                else:
+                    gold_chain = [{"tool": "query_logistics", "args": {"order_id": order_id}}]
             elif "authenticity" in route:
                 code = self._sample_code()
                 params["code"] = code
-                gold_chain = [{"tool": "authenticity_check", "args": {"code": code}}]
+                if image_path:
+                    # 注册图片到 executor session（类型为防伪码图片）
+                    img_ref = self._prepare_executor_session(code=code, image_path=image_path)
+                    # 修改图片类型为防伪码图片，使 OCR 能识别
+                    self.executor.images[img_ref]["type"] = "anti_fake"
+                    self.executor.images[img_ref]["code"] = code
+                    self.executor.images[img_ref]["product_id"] = self._sample_product_id()
+                    # OCR-first 链路：先 OCR 识别防伪码，再验证
+                    gold_chain = [
+                        {"tool": "ocr", "args": {"image_ref": img_ref, "focus": "authenticity_code"}},
+                        {"tool": "authenticity_check", "args": {"code": code}},
+                    ]
+                else:
+                    gold_chain = [{"tool": "authenticity_check", "args": {"code": code}}]
             elif "search" in route:
                 category = self._sample_category()
                 params["category"] = category
-                gold_chain = [{"tool": "text_search", "args": {"query": category}}]
+                # 如果有图片，先用 OCR 提取文字再搜索
+                if image_path:
+                    img_ref = self._prepare_executor_session(image_path=image_path)
+                    gold_chain = [
+                        {"tool": "ocr", "args": {"image_ref": img_ref, "focus": "all"}},
+                        {"tool": "text_search", "args": {"query": category}},
+                    ]
+                else:
+                    gold_chain = [{"tool": "text_search", "args": {"query": category}}]
             elif "refund" in route:
                 refund_id = self._sample_refund_id()
                 params["refund_id"] = refund_id
-                gold_chain = [{"tool": "query_refund", "args": {"refund_id": refund_id}}]
+                if image_path:
+                    # 注册图片到 executor session（类型为订单截图）
+                    img_ref = self._prepare_executor_session(image_path=image_path)
+                    # 修改图片类型为订单截图，使 OCR 能识别
+                    self.executor.images[img_ref]["type"] = "order_screenshot"
+                    self.executor.images[img_ref]["order_id"] = self._sample_order_id()
+                    self.executor.images[img_ref]["price"] = round(random.uniform(50, 500), 2)
+                    self.executor.images[img_ref]["status_cn"] = "退款中"
+                    # OCR-first 链路：先 OCR 识别退款单号，再查退款
+                    gold_chain = [
+                        {"tool": "ocr", "args": {"image_ref": img_ref, "focus": "all"}},
+                        {"tool": "query_refund", "args": {"refund_id": refund_id}},
+                    ]
+                else:
+                    gold_chain = [{"tool": "query_refund", "args": {"refund_id": refund_id}}]
             elif "vl_describe" in route:
-                # 从 images 目录采样一张图
-                img_dir = self.data_dir / "images"
-                if img_dir.exists():
-                    imgs = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))
-                    if imgs:
-                        image_path = str(random.choice(imgs))
-                gold_chain = [{"tool": "vl_describe", "args": {"image": image_path or ""}}]
+                if self._cached_images:
+                    image_path = str(random.choice(self._cached_images))
+                    img_ref = self._prepare_executor_session(image_path=image_path)
+                gold_chain = [{"tool": "vl_describe", "args": {"image_ref": img_ref or ""}}]
+            elif "ocr" in route:
+                if self._cached_images:
+                    image_path = str(random.choice(self._cached_images))
+                    img_ref = self._prepare_executor_session(image_path=image_path)
+                gold_chain = [{"tool": "ocr", "args": {"image_ref": img_ref or "", "focus": "all"}}]
+            elif "ask_user" in route:
+                category = self._sample_category()
+                params["category"] = category
+                # 如果有图片，先用 VL 描述图片
+                if image_path:
+                    img_ref = self._prepare_executor_session(image_path=image_path)
+                    gold_chain = [
+                        {"tool": "vl_describe", "args": {"image_ref": img_ref, "question": "这个商品是什么？"}},
+                        {"tool": "ask_user", "args": {"question": "请问您想查询什么？请提供具体信息。"}},
+                    ]
+                else:
+                    gold_chain = [{"tool": "ask_user", "args": {"question": "请问您想查询什么？请提供具体信息。"}}]
+            elif "transfer_to_human" in route:
+                # 如果有图片，先用 VL 描述图片
+                if image_path:
+                    img_ref = self._prepare_executor_session(image_path=image_path)
+                    gold_chain = [
+                        {"tool": "vl_describe", "args": {"image_ref": img_ref, "question": "这个商品有什么问题？"}},
+                        {"tool": "transfer_to_human", "args": {"reason": "用户情绪激动，需要人工介入"}},
+                    ]
+                else:
+                    gold_chain = [{"tool": "transfer_to_human", "args": {"reason": "用户情绪激动，需要人工介入"}}]
 
-            query = template.format(**params)
+            # 80% 使用动态查询，20% 使用模板（大幅提高多样性）
+            if random.random() < 0.8:
+                dynamic_query = self._generate_dynamic_query(route, params, has_image=bool(image_path))
+                if dynamic_query:
+                    query = dynamic_query
+                else:
+                    query = template.format(**params)
+            else:
+                query = template.format(**params)
 
-            # 执行并构建轨迹
-            # 终答需要从执行结果中提取数据来填充模板
-            # 这里先用占位符，build_trajectory 会用真实 Observation
-            # 我们在执行完成后从 Observation 中提取数据来生成终答
             trajectory_data = self._execute_and_build_trajectory(
                 query, image_path, gold_chain, route, params
             )
@@ -556,42 +1461,105 @@ class TrainingDataGenerator:
 
         while len(trajectories) < n and attempts < max_attempts:
             attempts += 1
+            # 重置 executor 状态（防止状态泄漏）
+            self.executor.grounded = set()
+            self.executor.session = {}
+            self.executor.images = {}
             route = random.choice(["refund_flow", "price_compare", "post_delivery"])
             template = random.choice(self.templates[route])
             params = {}
             gold_chain = []
             image_path = None
 
+            # 如果模板包含 [IMG] 标记，采样一张图片
+            # 对于 refund_flow 和 post_delivery，强制使用图片（提高多模态覆盖）
+            if "[IMG]" in template and self._cached_images:
+                image_path = str(random.choice(self._cached_images))
+            elif route in ["refund_flow", "post_delivery"] and self._cached_images:
+                # 强制使用图片，即使模板没有 [IMG]
+                image_path = str(random.choice(self._cached_images))
+
             if route == "refund_flow":
                 order_id = self._sample_refundable_order_id()
                 params["order_id"] = order_id
-                # 注册占位图片 + 溯源
-                img_ref = self._prepare_executor_session(order_id=order_id, image_path="placeholder.jpg")
-                gold_chain = [
-                    {"tool": "vl_describe", "args": {"image_ref": img_ref, "question": "商品是否有瑕疵？"}},
-                    {"tool": "create_refund_ticket", "args": {
-                        "order_id": order_id, "reason": "质量问题",
-                        "description": "商品存在质量瑕疵", "images": [],
-                    }},
-                ]
+                # 溯源
+                self._prepare_executor_session(order_id=order_id)
+                if image_path:
+                    # 有图：OCR 识别订单号 → 查订单 → 创建退款
+                    img_ref = self._prepare_executor_session(image_path=image_path)
+                    # 设置图片类型为订单截图
+                    self.executor.images[img_ref]["type"] = "order_screenshot"
+                    self.executor.images[img_ref]["order_id"] = order_id
+                    self.executor.images[img_ref]["price"] = round(random.uniform(50, 500), 2)
+                    self.executor.images[img_ref]["status_cn"] = "已签收"
+                    gold_chain = [
+                        {"tool": "ocr", "args": {"image_ref": img_ref, "focus": "order_id"}},
+                        {"tool": "query_order", "args": {"order_id": order_id}},
+                        {"tool": "create_refund_ticket", "args": {
+                            "order_id": order_id, "reason": "质量问题",
+                            "description": "商品存在质量瑕疵", "images": [],
+                        }},
+                    ]
+                else:
+                    # 无图：直接创建退款
+                    gold_chain = [
+                        {"tool": "create_refund_ticket", "args": {
+                            "order_id": order_id, "reason": "质量问题",
+                            "description": "商品存在质量瑕疵", "images": [],
+                        }},
+                    ]
             elif route == "price_compare":
-                # 先搜索获取真实 product_id，再比价
-                keyword = self._sample_search_keyword()
-                gold_chain = [
-                    {"tool": "text_search", "args": {"query": keyword}},
-                    {"tool": "price_compare", "args": {"product_id": "__FROM_SEARCH__"}},
-                ]
+                # 同款比价：模板提到图片，需要图片
+                if self._cached_images:
+                    image_path = str(random.choice(self._cached_images))
+                if image_path:
+                    # 有图：VL 描述商品 → 搜索 → 比价
+                    img_ref = self._prepare_executor_session(image_path=image_path)
+                    gold_chain = [
+                        {"tool": "vl_describe", "args": {"image_ref": img_ref, "question": "这个商品是什么？"}},
+                        {"tool": "text_search", "args": {"query": "__FROM_DESCRIBE__"}},
+                        {"tool": "price_compare", "args": {"product_id": "__FROM_SEARCH__"}},
+                    ]
+                else:
+                    # 无图：回退到纯文本搜索
+                    keyword = self._sample_search_keyword()
+                    gold_chain = [
+                        {"tool": "text_search", "args": {"query": keyword}},
+                        {"tool": "price_compare", "args": {"product_id": "__FROM_SEARCH__"}},
+                    ]
             elif route == "post_delivery":
                 order_id = self._sample_order_id()
-                code = self._sample_code()
                 params["order_id"] = order_id
-                self._prepare_executor_session(order_id=order_id, code=code)
-                gold_chain = [
-                    {"tool": "query_logistics", "args": {"order_id": order_id}},
-                    {"tool": "authenticity_check", "args": {"code": code}},
-                ]
+                self._prepare_executor_session(order_id=order_id)
+                if image_path:
+                    # 有图：OCR 识别订单号 → 查物流 → 验真伪
+                    img_ref = self._prepare_executor_session(image_path=image_path)
+                    # 设置图片类型为订单截图
+                    self.executor.images[img_ref]["type"] = "order_screenshot"
+                    self.executor.images[img_ref]["order_id"] = order_id
+                    self.executor.images[img_ref]["price"] = round(random.uniform(50, 500), 2)
+                    self.executor.images[img_ref]["status_cn"] = "已签收"
+                    gold_chain = [
+                        {"tool": "ocr", "args": {"image_ref": img_ref, "focus": "order_id"}},
+                        {"tool": "query_logistics", "args": {"order_id": order_id}},
+                        {"tool": "authenticity_check", "args": {"code": self._sample_code()}},
+                    ]
+                else:
+                    # 无图：只查物流
+                    gold_chain = [
+                        {"tool": "query_logistics", "args": {"order_id": order_id}},
+                    ]
 
-            query = template.format(**params)
+            # 80% 使用动态查询，20% 使用模板（大幅提高多样性）
+            if random.random() < 0.8:
+                dynamic_query = self._generate_dynamic_query(route, params, has_image=bool(image_path))
+                if dynamic_query:
+                    query = dynamic_query
+                else:
+                    query = template.format(**params)
+            else:
+                query = template.format(**params)
+
             trajectory_data = self._execute_and_build_trajectory(
                 query, image_path, gold_chain, route, params
             )
@@ -627,14 +1595,23 @@ class TrainingDataGenerator:
 
         while len(trajectories) < n and attempts < max_attempts:
             attempts += 1
+            # 重置 executor 状态（防止状态泄漏）
+            self.executor.grounded = set()
+            self.executor.session = {}
+            self.executor.images = {}
             route = random.choice([
                 "multi_turn_lrv", "multi_turn_spa",
                 "multi_turn_ocr_logistics", "multi_turn_img_search",
+                "multi_turn_emotion", "multi_turn_vague",
             ])
             template = random.choice(self.templates[route])
             params = {}
             gold_chain = []
             image_path = None
+
+            # 如果模板包含 [IMG] 标记，采样一张图片
+            if "[IMG]" in template and self._cached_images:
+                image_path = str(random.choice(self._cached_images))
 
             order_id = self._sample_order_id()
             category = self._sample_category()
@@ -648,37 +1625,98 @@ class TrainingDataGenerator:
                     continue
                 order_id = random.choice(available)
                 params["order_id"] = order_id
-                img_ref = self._prepare_executor_session(order_id=order_id, image_path="placeholder.jpg")
+                if image_path:
+                    img_ref = self._prepare_executor_session(order_id=order_id, image_path=image_path)
+                    # 设置图片类型为订单截图
+                    self.executor.images[img_ref]["type"] = "order_screenshot"
+                    self.executor.images[img_ref]["order_id"] = order_id
+                    self.executor.images[img_ref]["price"] = round(random.uniform(50, 500), 2)
+                    self.executor.images[img_ref]["status_cn"] = "已签收"
+                else:
+                    img_ref = self._prepare_executor_session(order_id=order_id, image_path="placeholder.jpg")
                 gold_chain = [
                     {"tool": "query_logistics", "args": {"order_id": order_id}},
-                    {"tool": "vl_describe", "args": {"image_ref": img_ref, "question": "商品是否有瑕疵？"}},
+                    {"tool": "ocr", "args": {"image_ref": img_ref, "focus": "order_id"}},
                     {"tool": "create_refund_ticket", "args": {
                         "order_id": order_id, "reason": "质量瑕疵",
                         "description": "签收后发现商品存在瑕疵", "images": [],
                     }},
                 ]
             elif route == "multi_turn_spa":
-                keyword = self._sample_search_keyword()
-                gold_chain = [
-                    {"tool": "text_search", "args": {"query": keyword}},
-                    {"tool": "price_compare", "args": {"product_id": "__FROM_SEARCH__"}},
-                ]
+                if image_path:
+                    # 有图：先描述图片，再搜索比价
+                    img_ref = self._prepare_executor_session(image_path=image_path)
+                    gold_chain = [
+                        {"tool": "vl_describe", "args": {"image_ref": img_ref, "question": "这个商品是什么？"}},
+                        {"tool": "text_search", "args": {"query": "__FROM_DESCRIBE__"}},
+                        {"tool": "price_compare", "args": {"product_id": "__FROM_SEARCH__"}},
+                    ]
+                else:
+                    # 无图：纯文本搜索
+                    keyword = self._sample_search_keyword()
+                    gold_chain = [
+                        {"tool": "text_search", "args": {"query": keyword}},
+                        {"tool": "price_compare", "args": {"product_id": "__FROM_SEARCH__"}},
+                    ]
             elif route == "multi_turn_ocr_logistics":
-                img_dir = self.data_dir / "images"
-                if img_dir.exists():
-                    imgs = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))
-                    if imgs:
-                        image_path = str(random.choice(imgs))
+                if self._cached_images:
+                    image_path = str(random.choice(self._cached_images))
                 img_ref = self._prepare_executor_session(order_id=order_id, image_path=image_path or "placeholder.jpg")
+                # 设置图片类型为订单截图
+                self.executor.images[img_ref]["type"] = "order_screenshot"
+                self.executor.images[img_ref]["order_id"] = order_id
+                self.executor.images[img_ref]["price"] = round(random.uniform(50, 500), 2)
+                self.executor.images[img_ref]["status_cn"] = "已发货"
                 gold_chain = [
                     {"tool": "ocr", "args": {"image_ref": img_ref, "focus": "all"}},
                     {"tool": "query_logistics", "args": {"order_id": order_id}},
                 ]
             elif route == "multi_turn_img_search":
-                keyword = self._sample_search_keyword()
+                # 多轮图片搜索：需要图片，调用 vl_describe 提取商品信息
+                if self._cached_images:
+                    image_path = str(random.choice(self._cached_images))
+                if image_path:
+                    img_ref = self._prepare_executor_session(image_path=image_path)
+                    gold_chain = [
+                        {"tool": "vl_describe", "args": {"image_ref": img_ref, "question": "这个商品是什么？"}},
+                        {"tool": "text_search", "args": {"query": "__FROM_DESCRIBE__"}},
+                        {"tool": "price_compare", "args": {"product_id": "__FROM_SEARCH__"}},
+                    ]
+                else:
+                    # 无图时回退到纯文本搜索
+                    keyword = self._sample_search_keyword()
+                    gold_chain = [
+                        {"tool": "text_search", "args": {"query": keyword}},
+                        {"tool": "price_compare", "args": {"product_id": "__FROM_SEARCH__"}},
+                    ]
+            elif route == "multi_turn_emotion":
+                # 情绪升级：查询→不满→投诉，含 ask_user / transfer_to_human
+                order_id = self._sample_order_id()
+                refund_id = self._sample_refund_id()
+                params["order_id"] = order_id
+                params["refund_id"] = refund_id
+                self._prepare_executor_session(order_id=order_id)
+                if image_path:
+                    img_ref = self._prepare_executor_session(image_path=image_path)
+                    gold_chain = [
+                        {"tool": "query_logistics", "args": {"order_id": order_id}},
+                        {"tool": "ask_user", "args": {"question": "非常抱歉给您带来不好的体验，请问您希望如何处理？"}},
+                        {"tool": "transfer_to_human", "args": {"reason": "用户情绪激动，要求投诉"}},
+                    ]
+                else:
+                    gold_chain = [
+                        {"tool": "query_logistics", "args": {"order_id": order_id}},
+                        {"tool": "ask_user", "args": {"question": "非常抱歉给您带来不好的体验，请问您希望如何处理？"}},
+                        {"tool": "transfer_to_human", "args": {"reason": "用户情绪激动，要求投诉"}},
+                    ]
+            elif route == "multi_turn_vague":
+                # 模糊指代：用户使用模糊词，agent 需要 ask_user 确认
+                order_id = self._sample_order_id()
+                params["order_id"] = order_id
+                self._prepare_executor_session(order_id=order_id)
                 gold_chain = [
-                    {"tool": "text_search", "args": {"query": keyword}},
-                    {"tool": "price_compare", "args": {"product_id": "__FROM_SEARCH__"}},
+                    {"tool": "ask_user", "args": {"question": "请问您指的是哪个订单？麻烦提供一下订单号。"}},
+                    {"tool": "query_logistics", "args": {"order_id": order_id}},
                 ]
 
             # 多轮：将 template 中的多句话作为多轮 user 消息
@@ -692,14 +1730,18 @@ class TrainingDataGenerator:
 
             # 扩展为多轮 messages（在工具调用之间插入额外的 user 消息）
             messages = trajectory_data["messages"]
-            # 在最后一个 assistant 消息前插入多轮 user 消息
+            # 在工具调用之间插入多轮 user 消息
             if len(template) > 1:
                 extra_turns = [t.format(**params) for t in template[1:]]
-                # 在最后的 assistant 终答前插入
-                final_assistant = messages.pop()
-                for turn in extra_turns:
-                    messages.append({"role": "user", "content": turn})
-                messages.append(final_assistant)
+                # 找到所有 tool Observation 的位置，在它们之后插入 user 消息
+                tool_obs_indices = [i for i, msg in enumerate(messages) if msg["role"] == "tool"]
+                # 在每个 tool Observation 之后插入对应的 user 消息（如果有的话）
+                for idx, turn in enumerate(extra_turns):
+                    if idx < len(tool_obs_indices):
+                        insert_pos = tool_obs_indices[idx] + 1
+                        messages.insert(insert_pos, {"role": "user", "content": turn})
+                        # 更新后续 tool Observation 的索引
+                        tool_obs_indices = [i + 1 if i >= insert_pos else i for i in tool_obs_indices]
 
             # 跟踪已使用退款订单
             if route == "multi_turn_lrv":
@@ -729,10 +1771,20 @@ class TrainingDataGenerator:
     def generate_anti_pattern_questions(self, n: int = 1000) -> List[Dict]:
         """生成对抗题目（10 类场景，正确行为轨迹）"""
         trajectories = []
-        per_category = max(1, n // len(self.ANTI_PATTERN_CATEGORIES))
+        # PRD 配比：情绪与投诉 350 条，其他均分
+        emotion_cats = {"情绪失控要挟", "拒绝认错/甩锅第三方", "图文不符/误导"}
+        emotion_count = min(350, n // 10)
+        other_count = n - emotion_count
+        other_cats = [c for c in self.ANTI_PATTERN_CATEGORIES if c["name"] not in emotion_cats]
+        per_other = max(1, other_count // len(other_cats)) if other_cats else 0
 
         for cat in self.ANTI_PATTERN_CATEGORIES:
-            for i in range(per_category):
+            # 根据类别确定数量
+            if cat["name"] in emotion_cats:
+                count = emotion_count // len(emotion_cats)
+            else:
+                count = per_other
+            for i in range(count):
                 template = random.choice(cat["templates"])
                 params = {}
                 if "{order_id}" in template:
@@ -833,6 +1885,21 @@ class TrainingDataGenerator:
                 else:
                     return None
 
+            # 替换 __FROM_DESCRIBE__ 占位符（从上一步 vl_describe 结果中提取关键词）
+            if args.get("query") == "__FROM_DESCRIBE__":
+                if observations:
+                    last_obs = observations[-1]
+                    # 从 vl_describe 结果中提取关键词
+                    desc = last_obs.get("description", last_obs.get("content", ""))
+                    # 提取前 3 个有意义的词作为搜索关键词
+                    words = [w for w in desc.split() if len(w) > 2][:3]
+                    if words:
+                        args["query"] = " ".join(words)
+                    else:
+                        args["query"] = self._sample_search_keyword()
+                else:
+                    args["query"] = self._sample_search_keyword()
+
             # 预置溯源
             for key in ("order_id", "refund_id", "code", "product_id"):
                 if key in args and args[key]:
@@ -869,10 +1936,18 @@ class TrainingDataGenerator:
                     d["product_id"] for d in docs if "product_id" in d
                 ]
 
-            # tool Observation
+            # tool Observation：分层截断，核心字段保留完整
+            obs_content = json.dumps(obs_data, ensure_ascii=False)
+            if len(obs_content) > 2048:
+                # 核心字段保留，description/details 截断到 1000 字符
+                truncated = dict(obs_data)
+                for key in ("description", "details", "content"):
+                    if key in truncated and isinstance(truncated[key], str) and len(truncated[key]) > 1000:
+                        truncated[key] = truncated[key][:1000] + "..."
+                obs_content = json.dumps(truncated, ensure_ascii=False)
             messages.append({
                 "role": "tool",
-                "content": json.dumps(obs_data, ensure_ascii=False)[:2048],
+                "content": obs_content,
             })
 
         # 根据路由 + Observation 生成终答
@@ -927,7 +2002,11 @@ class TrainingDataGenerator:
             )
         elif "refund" in route:
             tpl = random.choice(templates["refund_created"])
-            return tpl.format(refund_id=obs.get("refund_id", "RFD_UNKNOWN"))
+            refund_id = obs.get("refund_id", "")
+            if not refund_id:
+                # 退款创建失败，返回错误信息
+                return "退款申请创建失败，请稍后重试。"
+            return tpl.format(refund_id=refund_id)
         elif "price_compare" in route:
             tpl = random.choice(templates["price_compare"])
             return tpl.format(
@@ -976,9 +2055,10 @@ class TrainingDataGenerator:
             elif route_type == "multi":
                 route = "refund_flow"
                 template = random.choice(self.templates[route])
-                order_id = self._sample_order_id()
+                order_id = self._sample_refundable_order_id()
                 params = {"order_id": order_id}
-                gold = {"expected_tools": ["vl_describe", "create_refund_ticket"], "order_id": order_id}
+                # 退款流程：用户未提供图，不调 vl_describe；直接创建退款
+                gold = {"expected_tools": ["create_refund_ticket"], "order_id": order_id}
                 query = template.format(**params)
             else:
                 cat = random.choice(self.ANTI_PATTERN_CATEGORIES)
@@ -996,6 +2076,7 @@ class TrainingDataGenerator:
                 "type": route_type,
                 "query": query,
                 "gold": gold,
+                "n_ref": len(gold.get("expected_tools", [])),
                 "metadata": {"template": template, "params": params},
             })
 
@@ -1011,9 +2092,15 @@ class TrainingDataGenerator:
         anti = self.generate_anti_pattern_questions(2000)
 
         for item in easy + medium:
+            # 确保 gold 字段存在
+            if "gold" not in item:
+                item["gold"] = {"expected_tools": []}
             item["n_ref"] = len(item.get("gold", {}).get("expected_tools", []))
 
         for item in anti:
+            # 确保 gold 字段存在
+            if "gold" not in item:
+                item["gold"] = {"expected_behavior": "ask_user"}
             item["n_ref"] = 0  # 对抗题不调用工具
 
         grpo_set = easy + medium + anti
@@ -1037,16 +2124,16 @@ class TrainingDataGenerator:
               f"商品 {len(self._real_product_ids)} | 退款 {len(self._real_refund_ids)}")
         print("-" * 60)
 
-        # 1. SFT 轨迹（20k：公开 QA 8k + 电商构造 6k + Teacher 6k）
+        # 1. SFT 轨迹（11-12k：适合 4B 模型）
         print("[1/4] 生成 SFT 轨迹...")
         sft_data = []
-        sft_data.extend(self.generate_single_tool_questions(8000))
+        sft_data.extend(self.generate_single_tool_questions(5000))
         print(f"  单工具轨迹: {len(sft_data)}")
-        sft_data.extend(self.generate_multi_tool_questions(6000))
+        sft_data.extend(self.generate_multi_tool_questions(3500))
         print(f"  +多工具轨迹: {len(sft_data)}")
-        sft_data.extend(self.generate_multi_turn_questions(4000))
+        sft_data.extend(self.generate_multi_turn_questions(2000))
         print(f"  +多轮轨迹: {len(sft_data)}")
-        sft_data.extend(self.generate_anti_pattern_questions(2000))
+        sft_data.extend(self.generate_anti_pattern_questions(1000))
         print(f"  +对抗轨迹: {len(sft_data)}")
 
         random.shuffle(sft_data)
@@ -1056,9 +2143,9 @@ class TrainingDataGenerator:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
         print(f"  -> {sft_output} ({len(sft_data)} 条)")
 
-        # 2. GRPO 题集（8k）
+        # 2. GRPO 题集（5k）
         print("[2/4] 生成 GRPO 题集...")
-        grpo_data = self.generate_grpo_questions(8000)
+        grpo_data = self.generate_grpo_questions(5000)
         grpo_output = output_path / "grpo_questions.jsonl"
         with open(grpo_output, "w", encoding="utf-8") as f:
             for item in grpo_data:
@@ -1074,9 +2161,9 @@ class TrainingDataGenerator:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
         print(f"  -> {eval_output} ({len(eval_data)} 条)")
 
-        # 4. 对抗题池（3600，10 类 × 360）
+        # 4. 对抗题池（2k，10 类 × 200）
         print("[4/4] 生成对抗题池...")
-        anti_data = self.generate_anti_pattern_questions(3600)
+        anti_data = self.generate_anti_pattern_questions(2000)
         anti_output = output_path / "anti_pattern_pool.jsonl"
         with open(anti_output, "w", encoding="utf-8") as f:
             for item in anti_data:
