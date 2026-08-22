@@ -20,6 +20,7 @@ from datetime import datetime
 sys.path.insert(0, str(Path(__file__).parent))
 
 from train_executor import TrainExecutor
+from llm_client import TeacherLLM
 
 # ---------------------------------------------------------------------------
 # System prompt & tools schema（与 06-function-calling.md 对齐）
@@ -92,6 +93,10 @@ class TrainingDataGenerator:
 
         # 模板库
         self.templates = self._load_templates()
+
+        # 初始化 LLM 客户端（用于生成自然语言查询）
+        self.llm_client = TeacherLLM(base_url="http://127.0.0.1:8001")
+        print(f"[gen_training_data] LLM 客户端已初始化（Teacher 服务器：http://127.0.0.1:8001）", flush=True)
 
     # ------------------------------------------------------------------
     # 数据加载
@@ -1964,9 +1969,30 @@ class TrainingDataGenerator:
         }
 
     def _generate_final_answer(
-        self, route: str, params: Dict, observations: List[Dict]
+        self, route: str, params: Dict, observations: List[Dict], use_llm: bool = True
     ) -> Optional[str]:
-        """根据路由和 Observation 生成终答。"""
+        """
+        根据路由和 Observation 生成终答。
+        
+        Args:
+            route: 路由类型
+            params: 查询参数
+            observations: 工具执行结果
+            use_llm: 是否使用 LLM 生成回答（默认 True）
+            
+        Returns:
+            生成的终答
+        """
+        # 如果启用 LLM，尝试使用 LLM 生成回答
+        if use_llm and self.llm_client:
+            try:
+                llm_answer = self._generate_llm_final_answer(route, params, observations)
+                if llm_answer and len(llm_answer) > 10:
+                    return llm_answer
+            except Exception as e:
+                print(f"[gen_training_data] LLM 生成终答失败，回退到模板: {e}", flush=True)
+        
+        # 回退到模板
         templates = self.FINAL_ANSWER_TEMPLATES
         obs = observations[0] if observations else {}
 
@@ -2018,6 +2044,205 @@ class TrainingDataGenerator:
             return f"图片分析结果：{desc}"
         else:
             return str(obs) if obs else "查询完成。"
+
+    def _generate_llm_final_answer(
+        self, route: str, params: Dict, observations: List[Dict]
+    ) -> Optional[str]:
+        """
+        使用 LLM 生成终答（替代模板）
+        
+        Args:
+            route: 路由类型
+            params: 查询参数
+            observations: 工具执行结果
+            
+        Returns:
+            LLM 生成的终答
+        """
+        # 构建上下文信息
+        obs = observations[0] if observations else {}
+        
+        # 根据路由类型构建不同的 prompt
+        if "logistics" in route:
+            order_id = params.get("order_id", obs.get("order_id", "未知"))
+            status_cn = obs.get("status_cn", "未知")
+            trajectory = obs.get("trajectory", [])
+            trajectory_summary = self._summarize_trajectory(trajectory)
+            
+            prompt = f"""你是一个客服助手。请根据以下物流信息，生成一个自然、专业的回复：
+
+订单号：{order_id}
+物流状态：{status_cn}
+物流轨迹：{trajectory_summary}
+
+要求：
+1. 回复要自然、专业，像真人客服的回复
+2. 包含订单号和物流状态
+3. 如果有物流轨迹，简要说明最新动态
+4. 语气友好、有帮助
+5. 只输出回复内容，不要有其他文字
+
+请生成回复："""
+            
+        elif "authenticity" in route:
+            code = params.get("code", obs.get("code", ""))
+            is_genuine = obs.get("is_genuine", False)
+            result = "正品" if is_genuine else "假货"
+            
+            prompt = f"""你是一个商品鉴定助手。请根据以下鉴定结果，生成一个自然、专业的回复：
+
+商品编码：{code}
+鉴定结果：{result}
+
+要求：
+1. 回复要自然、专业，像真人鉴定师的回复
+2. 明确告知鉴定结果
+3. 如果是假货，建议用户申请退款
+4. 语气友好、有帮助
+5. 只输出回复内容，不要有其他文字
+
+请生成回复："""
+            
+        elif "search" in route:
+            results = obs if isinstance(obs, list) else obs.get("results", [obs])
+            category = params.get("category", "")
+            count = len(results)
+            top = results[0] if results else {}
+            top_title = top.get("title", "")[:30]
+            top_price = top.get("price", "未知")
+            
+            prompt = f"""你是一个商品搜索助手。请根据以下搜索结果，生成一个自然、专业的回复：
+
+搜索类别：{category}
+找到商品数量：{count}
+最相关商品：{top_title}
+价格：{top_price}
+
+要求：
+1. 回复要自然、专业，像真人客服的回复
+2. 告知找到了多少商品
+3. 推荐最相关的商品，包含名称和价格
+4. 语气友好、有帮助
+5. 只输出回复内容，不要有其他文字
+
+请生成回复："""
+            
+        elif "refund" in route:
+            refund_id = params.get("refund_id", obs.get("refund_id", ""))
+            state_cn = obs.get("state_cn", obs.get("state", "未知"))
+            
+            prompt = f"""你是一个退款处理助手。请根据以下退款信息，生成一个自然、专业的回复：
+
+退款单号：{refund_id}
+退款状态：{state_cn}
+
+要求：
+1. 回复要自然、专业，像真人客服的回复
+2. 告知退款单号和当前状态
+3. 如果退款成功，告知预计到账时间
+4. 语气友好、有帮助
+5. 只输出回复内容，不要有其他文字
+
+请生成回复："""
+            
+        elif "price_compare" in route:
+            platform = obs.get("platform", "未知")
+            price = obs.get("min_price", obs.get("price", "未知"))
+            
+            prompt = f"""你是一个价格比较助手。请根据以下价格信息，生成一个自然、专业的回复：
+
+平台：{platform}
+最低价格：{price}
+
+要求：
+1. 回复要自然、专业，像真人客服的回复
+2. 告知在哪个平台找到了最低价格
+3. 可以提供一些购买建议
+4. 语气友好、有帮助
+5. 只输出回复内容，不要有其他文字
+
+请生成回复："""
+            
+        elif "vl_describe" in route:
+            desc = obs.get("description", obs.get("content", ""))
+            
+            prompt = f"""你是一个图片分析助手。请根据以下图片分析结果，生成一个自然、专业的回复：
+
+分析结果：{desc}
+
+要求：
+1. 回复要自然、专业，像真人客服的回复
+2. 总结图片分析结果
+3. 可以提供一些相关建议
+4. 语气友好、有帮助
+5. 只输出回复内容，不要有其他文字
+
+请生成回复："""
+            
+        else:
+            # 通用回复
+            prompt = f"""你是一个客服助手。请根据以下查询结果，生成一个自然、专业的回复：
+
+查询结果：{obs}
+
+要求：
+1. 回复要自然、专业，像真人客服的回复
+2. 总结查询结果
+3. 语气友好、有帮助
+4. 只输出回复内容，不要有其他文字
+
+请生成回复："""
+        
+        try:
+            # 构建消息
+            messages = [
+                {"role": "system", "content": "你是一个专业的客服助手。请根据用户的问题和工具返回的结果，生成自然、专业的回复。"},
+                {"role": "user", "content": prompt}
+            ]
+            
+            # 调用 LLM 生成回复
+            response = self.llm_client.chat(
+                messages=messages,
+                temperature=0.7,
+                max_tokens=300
+            )
+            
+            # 获取响应内容（已经过 strip_think 处理）
+            answer = response.get("content", "").strip()
+            
+            # 如果响应仍然包含 </think> 标签，手动处理
+            if "</think>" in answer:
+                think_end = answer.find("</think>")
+                if think_end != -1:
+                    answer = answer[think_end + 8:].strip()
+            
+            # 如果响应仍然包含 <think> 标签，手动处理
+            if "<think>" in answer:
+                think_start = answer.find("<think>")
+                if think_start != -1:
+                    answer = answer[:think_start].strip()
+            
+            # 清理响应
+            answer = answer.strip()
+            
+            # 移除可能的引号
+            if answer.startswith('"') and answer.endswith('"'):
+                answer = answer[1:-1]
+            if answer.startswith("'") and answer.endswith("'"):
+                answer = answer[1:-1]
+            
+            # 移除可能的换行符
+            answer = answer.replace("\n", " ").replace("\r", "")
+            
+            # 移除多余的空格
+            answer = " ".join(answer.split())
+            
+            return answer
+            
+        except Exception as e:
+            print(f"[gen_training_data] LLM 生成终答失败: {e}", flush=True)
+            # 回退到模板
+            return None
 
     def _summarize_trajectory(self, trajectory: List[Dict]) -> str:
         """将物流轨迹列表压缩为一句话摘要。"""
@@ -2110,30 +2335,46 @@ class TrainingDataGenerator:
     # ------------------------------------------------------------------
     # 主入口
     # ------------------------------------------------------------------
-    def generate_all(self, output_dir: str = "data/training"):
-        """生成所有训练数据"""
+    def generate_all(self, output_dir: str = "data/training", scale: float = 1.0):
+        """
+        生成所有训练数据
+        
+        Args:
+            output_dir: 输出目录
+            scale: 数据量缩放比例（0.0-1.0），默认1.0（全量）
+        """
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
+
+        # 根据 scale 计算各数据集的数量
+        sft_single = int(5000 * scale)
+        sft_multi = int(3500 * scale)
+        sft_turn = int(2000 * scale)
+        sft_anti = int(1000 * scale)
+        grpo_count = int(5000 * scale)
+        eval_count = int(1000 * scale)
+        anti_count = int(2000 * scale)
 
         print("=" * 60)
         print("训练数据生成 v2（ms-swift 轨迹格式）")
         print("=" * 60)
         print(f"数据资产: {self.data_dir}")
         print(f"输出目录: {output_path}")
+        print(f"缩放比例: {scale:.1%}")
         print(f"采样池: 订单 {len(self._real_order_ids)} | 防伪码 {len(self._real_codes)} | "
               f"商品 {len(self._real_product_ids)} | 退款 {len(self._real_refund_ids)}")
         print("-" * 60)
 
-        # 1. SFT 轨迹（11-12k：适合 4B 模型）
+        # 1. SFT 轨迹
         print("[1/4] 生成 SFT 轨迹...")
         sft_data = []
-        sft_data.extend(self.generate_single_tool_questions(5000))
+        sft_data.extend(self.generate_single_tool_questions(sft_single))
         print(f"  单工具轨迹: {len(sft_data)}")
-        sft_data.extend(self.generate_multi_tool_questions(3500))
+        sft_data.extend(self.generate_multi_tool_questions(sft_multi))
         print(f"  +多工具轨迹: {len(sft_data)}")
-        sft_data.extend(self.generate_multi_turn_questions(2000))
+        sft_data.extend(self.generate_multi_turn_questions(sft_turn))
         print(f"  +多轮轨迹: {len(sft_data)}")
-        sft_data.extend(self.generate_anti_pattern_questions(1000))
+        sft_data.extend(self.generate_anti_pattern_questions(sft_anti))
         print(f"  +对抗轨迹: {len(sft_data)}")
 
         random.shuffle(sft_data)
@@ -2143,27 +2384,27 @@ class TrainingDataGenerator:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
         print(f"  -> {sft_output} ({len(sft_data)} 条)")
 
-        # 2. GRPO 题集（5k）
+        # 2. GRPO 题集
         print("[2/4] 生成 GRPO 题集...")
-        grpo_data = self.generate_grpo_questions(5000)
+        grpo_data = self.generate_grpo_questions(grpo_count)
         grpo_output = output_path / "grpo_questions.jsonl"
         with open(grpo_output, "w", encoding="utf-8") as f:
             for item in grpo_data:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
         print(f"  -> {grpo_output} ({len(grpo_data)} 条)")
 
-        # 3. 评测集（1k）
+        # 3. 评测集
         print("[3/4] 生成评测集...")
-        eval_data = self.generate_eval_set(1000)
+        eval_data = self.generate_eval_set(eval_count)
         eval_output = output_path / "eval_set.jsonl"
         with open(eval_output, "w", encoding="utf-8") as f:
             for item in eval_data:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
         print(f"  -> {eval_output} ({len(eval_data)} 条)")
 
-        # 4. 对抗题池（2k，10 类 × 200）
+        # 4. 对抗题池
         print("[4/4] 生成对抗题池...")
-        anti_data = self.generate_anti_pattern_questions(2000)
+        anti_data = self.generate_anti_pattern_questions(anti_count)
         anti_output = output_path / "anti_pattern_pool.jsonl"
         with open(anti_output, "w", encoding="utf-8") as f:
             for item in anti_data:
@@ -2175,6 +2416,7 @@ class TrainingDataGenerator:
             "generated_at": datetime.now().isoformat(),
             "version": "v2",
             "seed": self.seed,
+            "scale": scale,
             "format": "ms-swift (messages + tools)",
             "counts": {
                 "sft_total": len(sft_data),
@@ -2207,10 +2449,11 @@ def main():
     parser.add_argument("--data-dir", type=str, default="data", help="数据资产目录")
     parser.add_argument("--output-dir", type=str, default="data/training", help="输出目录")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument("--scale", type=float, default=1.0, help="数据量缩放比例（0.0-1.0），默认1.0（全量）")
     args = parser.parse_args()
 
     generator = TrainingDataGenerator(data_dir=args.data_dir, seed=args.seed)
-    stats = generator.generate_all(output_dir=args.output_dir)
+    stats = generator.generate_all(output_dir=args.output_dir, scale=args.scale)
 
     print("\n生成统计:")
     print(json.dumps(stats, ensure_ascii=False, indent=2))
